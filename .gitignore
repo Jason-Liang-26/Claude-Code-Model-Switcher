@@ -1,0 +1,4 @@
+# Default ignored files
+.claude
+.idea
+__pycache__
