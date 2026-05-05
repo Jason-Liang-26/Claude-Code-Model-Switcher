@@ -812,8 +812,13 @@ def _unlock_linux_keyring() -> bool:
         return False
 
     if r.returncode == 0:
-        _print_color("✔ Keyring 已解锁\n", color="\033[32m")
-        return True
+        # 退出码成功不意味着真的解锁了，必须实测
+        if not _is_secret_service_locked():
+            _print_color("✔ Keyring 已解锁\n", color="\033[32m")
+            return True
+        _print_color("✘ 解锁命令执行成功，但 keyring 仍处于锁定状态\n",
+                     color="\033[33m")
+        return False
 
     err = (r.stderr or "").strip()
     if "invalid" in err.lower():
