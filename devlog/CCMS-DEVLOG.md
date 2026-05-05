@@ -149,14 +149,83 @@
 
 ---
 
+## Phase 9: 测试基础设施 (v0.9)
+
+**目标**：零第三方依赖的自动化测试
+
+**实现**：
+- `tests/` 目录 + `unittest`（标准库），`tempfile` + `unittest.mock` 隔离文件 I/O
+- 通过 `importlib.util.spec_from_file_location` 动态加载带连字符的主脚本
+- 30 个测试覆盖：纯函数解析、resolve 查找、平台检测、文件读写 roundtrip、迁移逻辑、冲突检测
+- 运行：`python -m unittest discover tests/`
+
+**附带修复**：`load_custom_models()` 文件未关闭 ResourceWarning
+
+---
+
+## Phase 10: helper 脚本跨目录修复 (v0.10)
+
+**问题**：`_generate_helper_scripts()` 用 `os.getcwd() + "claude-code-model-switcher.py"` 定位主脚本。安装后主脚本在 `~/.local/lib/` 下，helper 脚本生成在项目目录，跨目录时找不到主脚本。
+
+**修复**：用 `os.path.abspath(__file__)` 替代 `os.getcwd()` 定位主脚本，helper 脚本中新增 `$script` / `$SCRIPT` 变量指向主脚本实际路径，`$root` / `$SELF_DIR` 仍用于读取 settings.json。
+
+---
+
+## Phase 11: Linux 初步适配 (v0.11)
+
+**目标**：补齐缺失的 Linux 安装脚本和依赖检查
+
+**实现**：
+- `install.sh`：安装到 `~/.local/bin` + `~/.local/lib/`，前置检测 python3 + secret-tool
+- 按发行版给出 libsecret-tools 安装命令（apt/dnf/pacman）
+- `get_env_info_lines()` 中 Linux 无凭据后端时显示安装提示
+- `_getch()` / `select_from_list()` / `_press_enter()` EOF 健壮化：空字符串 → Ctrl+C
+
+---
+
+## Phase 12: Linux 终端输出修复 (v0.12)
+
+**问题**：Linux 下菜单显示"混乱"——每行输出不回车行首，文字偏移。
+
+**根因**：`tty.setraw()` 禁用了 `OPOST`（输出处理），`\n` 不自动转换为 `\r\n`。光标下移后停在上一行末列，后续输出从该列开始。
+
+**修复**：手动配置 termios，只关闭 `ECHO | ICANON | IEXTEN | ISIG`，保留 `c_oflag` 输出处理。
+
+---
+
+## Phase 13: Linux keyring 适配 (v0.13) — 进行中
+
+**目标**：解决 headless Linux 上 GNOME Keyring 的 locked collection 问题
+
+**问题链**：
+1. `secret-tool store` → "Cannot create an item in a locked collection"
+2. `gnome-keyring-daemon --unlock` 静默等待 stdin，无提示符
+3. D-Bus session bus 和守护进程在 SSH 登录后不自动启动
+4. 删除 `login.keyring` 会破坏用户其他应用的凭据
+
+**实现**：
+- `_is_secret_service_locked()`：主动检测 keyring 锁定状态
+- `_unlock_linux_keyring()`：CCMS 自己的交互式解锁（查找控制套接字 → 提示密码 → 传密码给 `--unlock` → 实测验证）
+- `_ensure_ccms_collection()`：通过 busctl/gdbus 创建 CCMS 专属 collection（`claude-code-models`），与用户 `login.keyring` 隔离
+- `_try_start_keyring_daemon()`：检测并自动启动守护进程
+- 菜单环境信息显示锁定状态 + 解锁提示
+- D-Bus 超时、守护进程缺失等场景友好提示
+
+**待解决**：busctl/gdbus 不可用且守护进程未运行时的终极回退方案（文件加密存储）
+
+---
+
 ## 产物清单
 
 | 文件 | 说明 |
 |------|------|
-| `claude-code-model-switcher.py` | 主脚本 (~900行) |
-| `claude-code-model-switcher.cmd` | 项目本地启动器 |
+| `claude-code-model-switcher.py` | 主脚本 |
+| `claude-code-model-switcher.cmd` | 项目本地启动器 (Windows) |
 | `install.cmd` | 安装器 (CMD) |
 | `install.ps1` | 安装器 (PowerShell) |
+| `install.sh` | 安装器 (Linux/macOS) |
 | `CCMS-SPEC.md` | 规格文档 |
+| `CLAUDE.md` | Claude Code 指引 |
 | `devlog/CCMS-DEVLOG.md` | 本文档 |
 | `claude-code-model-switcher-help.md` | 用户手册 |
+| `tests/test_ccms.py` | 单元测试 (30 cases, stdlib) |
