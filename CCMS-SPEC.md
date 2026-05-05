@@ -85,7 +85,11 @@ Claude Code 启动
 |------|----|------|-----|---------|
 | wincred | Windows | 凭据管理器 (DPAPI) | advapi32.CredReadW/WriteW (ctypes) | Windows 登录会话 |
 | macos-keychain | macOS | 钥匙串 | security CLI | 钥匙串访问控制 |
-| secret-service | Linux | GNOME/KDE | secret-tool CLI | libsecret |
+| age | Linux (headless 首选) | `~/.local/share/ccms/creds/*.age` | age CLI | Curve25519 密钥对 |
+| secret-service | Linux (GUI) | GNOME/KDE | secret-tool CLI | libsecret |
+| linux-file | Linux (fallback) | `~/.local/share/ccms/creds/*.enc` | openssl CLI | AES-256-CBC + 本地密钥文件 |
+
+**Linux 后端选择逻辑**：GUI 会话（`$DISPLAY` / `$WAYLAND_DISPLAY` 存在）→ secret-service；headless + age 已安装 → age（`$CCMS_AGE_IDENTITY` 指定身份文件）；否则 → linux-file (openssl)。
 
 旧版 `sk` 字段首次运行时自动迁移到凭据管理器。
 
@@ -148,5 +152,5 @@ Claude Code 启动
 ## 安全边界
 
 - sk 仅存 OS 凭据管理器，配置文件零明文
-- 凭据读取受限于当前 OS 用户会话（DPAPI/Keychain/secret-service）
+- 凭据读取受限于当前 OS 用户会话（DPAPI/Keychain/age/file-permissions/secret-service）
 - WSL 下需用 Windows Python（`python.exe`）调用 advapi32，Linux Python 无 DPAPI 访问权限

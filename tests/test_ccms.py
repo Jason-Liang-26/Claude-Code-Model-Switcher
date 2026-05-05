@@ -87,6 +87,100 @@ class TestDetectPlatform(unittest.TestCase):
         self.assertEqual(ccms._detect_platform(), "linux")
 
 
+class TestIsGuiSession(unittest.TestCase):
+    """_is_gui_session — detects display environment."""
+
+    @mock.patch.dict("ccms.os.environ", {"DISPLAY": ":0"}, clear=True)
+    def test_x11_display(self):
+        self.assertTrue(ccms._is_gui_session())
+
+    @mock.patch.dict("ccms.os.environ", {"WAYLAND_DISPLAY": "wayland-0"},
+                     clear=True)
+    def test_wayland_display(self):
+        self.assertTrue(ccms._is_gui_session())
+
+    @mock.patch.dict("ccms.os.environ", {}, clear=True)
+    def test_headless(self):
+        self.assertFalse(ccms._is_gui_session())
+
+
+class TestAgeResolveIdentity(unittest.TestCase):
+    """_age_resolve_identity — resolves age identity path."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.patch_dir = mock.patch("ccms.CCMS_AGE_IDENTITY_DEFAULT",
+                                    os.path.join(self.tmpdir.name,
+                                                 "identity.age"))
+        self.patch_dir.start()
+
+    def tearDown(self):
+        self.patch_dir.stop()
+        self.tmpdir.cleanup()
+
+    @mock.patch("ccms.os.environ", {"CCMS_AGE_IDENTITY": "/custom/key.age"})
+    @mock.patch("ccms.os.path.isfile", return_value=True)
+    @mock.patch("ccms.os.path.realpath", side_effect=lambda x: x)
+    def test_env_var(self, mock_realpath, mock_isfile):
+        result = ccms._age_resolve_identity()
+        self.assertEqual(result, "/custom/key.age")
+
+    def test_not_found(self):
+        self.assertIsNone(ccms._age_resolve_identity())
+
+    @mock.patch("ccms.os.chmod")
+    @mock.patch("ccms.subprocess.run")
+    def test_autocreate(self, mock_run, mock_chmod):
+        def fake_run(args, **_kw):
+            if args and args[0] == "age-keygen" and len(args) >= 3:
+                Path(args[2]).write_text("AGE-SECRET-KEY-xxxxxxxxx")
+            return mock.Mock(returncode=0)
+        mock_run.side_effect = fake_run
+        result = ccms._age_resolve_identity(autocreate=True)
+        self.assertIsNotNone(result)
+        self.assertIn("identity.age", result)
+        self.assertTrue(mock_run.called)
+
+    @mock.patch("ccms.subprocess.run")
+    def test_autocreate_fails(self, mock_run):
+        mock_run.return_value = mock.Mock(returncode=1)
+        result = ccms._age_resolve_identity(autocreate=True)
+        self.assertIsNone(result)
+
+
+class TestLinuxFileResolveIdentity(unittest.TestCase):
+    """_linux_file_resolve_identity — resolves openssl key path."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.patch_dir = mock.patch("ccms.CCMS_FILE_KEY_DEFAULT",
+                                    os.path.join(self.tmpdir.name,
+                                                 "ccms.key"))
+        self.patch_dir.start()
+
+    def tearDown(self):
+        self.patch_dir.stop()
+        self.tmpdir.cleanup()
+
+    def test_not_found(self):
+        self.assertIsNone(ccms._linux_file_resolve_identity())
+
+    @mock.patch("ccms.subprocess.run")
+    def test_autocreate(self, mock_run):
+        mock_run.return_value = mock.Mock(
+            returncode=0, stdout="a1b2c3d4e5f6g7h8"
+        )
+        result = ccms._linux_file_resolve_identity(autocreate=True)
+        self.assertIsNotNone(result)
+        self.assertIn("ccms.key", result)
+
+    @mock.patch("ccms.subprocess.run")
+    def test_autocreate_fails(self, mock_run):
+        mock_run.return_value = mock.Mock(returncode=1)
+        result = ccms._linux_file_resolve_identity(autocreate=True)
+        self.assertIsNone(result)
+
+
 class TestCredDefaultConfig(unittest.TestCase):
     """cred_default_config — generates platform-appropriate credential config."""
 
@@ -106,12 +200,41 @@ class TestCredDefaultConfig(unittest.TestCase):
         self.assertEqual(cfg["account"], "my-model")
 
     @mock.patch("ccms.platform.system")
-    def test_linux(self, mock_system):
+    @mock.patch("ccms._is_gui_session", return_value=True)
+    def test_linux_gui_secret_service(self, mock_gui, mock_system):
         mock_system.return_value = "Linux"
         cfg = ccms.cred_default_config("my-model")
         self.assertEqual(cfg["type"], "secret-service")
         self.assertIn("label", cfg)
         self.assertIn("key", cfg)
+
+    @mock.patch("ccms.platform.system")
+    @mock.patch("ccms._is_gui_session", return_value=False)
+    @mock.patch("ccms.shutil.which", return_value=None)  # no age
+    @mock.patch("ccms._linux_file_resolve_identity",
+                return_value="/home/user/.local/share/ccms/ccms.key")
+    def test_linux_headless_fallback(self, mock_id, mock_which, mock_gui,
+                                      mock_system):
+        mock_system.return_value = "Linux"
+        cfg = ccms.cred_default_config("my-model")
+        self.assertEqual(cfg["type"], "linux-file")
+        self.assertEqual(cfg["identity"],
+                         "/home/user/.local/share/ccms/ccms.key")
+        self.assertEqual(cfg["keyname"], "my-model")
+
+    @mock.patch("ccms.platform.system")
+    @mock.patch("ccms._is_gui_session", return_value=False)
+    @mock.patch("ccms.shutil.which", return_value="/usr/bin/age")
+    @mock.patch("ccms._age_resolve_identity",
+                return_value="/home/user/.local/share/ccms/identity.age")
+    def test_linux_headless_age(self, mock_id, mock_which, mock_gui,
+                                 mock_system):
+        mock_system.return_value = "Linux"
+        cfg = ccms.cred_default_config("my-model")
+        self.assertEqual(cfg["type"], "age")
+        self.assertEqual(cfg["identity"],
+                         "/home/user/.local/share/ccms/identity.age")
+        self.assertEqual(cfg["keyname"], "my-model")
 
 
 class TestIsGlobalConfigDir(unittest.TestCase):

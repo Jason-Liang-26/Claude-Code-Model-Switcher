@@ -141,7 +141,11 @@ claude-code-model-switcher --migrate-import < keys.json
 |------|----|---------|------|
 | `wincred` | Windows | 控制面板 → 凭据管理器 → Windows 凭据 | `target` |
 | `macos-keychain` | macOS | 钥匙串访问 → 登录 | `service`, `account` |
-| `secret-service` | Linux | GNOME Keyring / KDE Wallet | `key`, `label` |
+| `secret-service` | Linux (GUI) | GNOME Keyring / KDE Wallet | `key`, `label` |
+| `age` | Linux (headless 首选) | `~/.local/share/ccms/creds/*.age` | `identity`, `keyname` |
+| `linux-file` | Linux (fallback) | `~/.local/share/ccms/creds/*.enc` | `keyname` |
+
+**Linux 后端自动选择**：GUI 会话优先 secret-service；headless (SSH/tty) 优先 age（需安装，否则回退到 openssl）。age 身份文件自动生成于 `~/.local/share/ccms/identity.age`，也可通过 `$CCMS_AGE_IDENTITY` 环境变量或 `~/.config/ccms/age-identity` 文件指定自定义路径。
 
 **自动迁移**：旧版 `sk` 字段首次运行时自动转到凭据管理器，同时补全 `modelName` 字段。
 
@@ -248,7 +252,7 @@ claude-code-model-switcher --migrate-import < keys.json
 - **零第三方依赖**，凭据操作全部使用系统原生接口
   - Windows: `advapi32` 通过 ctypes
   - macOS: `security` CLI
-  - Linux: `secret-tool` CLI（需要安装了 libsecret）
+  - Linux: `secret-tool` CLI (GUI) / `age` CLI (headless 首选) / `openssl` CLI (fallback，OS 自带)
 - **终端**：支持 Windows Terminal（PowerShell/cmd）、WSL、Git Bash、原生 Linux/macOS
 - **箭头键**：同时处理 `\xe0`（msvcrt）和 `\x1b[`（VT）两种编码
 

@@ -44,7 +44,7 @@ All project-level paths are resolved against `os.getcwd()` at module load time:
 |-------|---------|---------|
 | Global models | `~/.claude/custom-models.json` | Alias, URL, modelName, credential reference (no sk) |
 | Project config | `./.claude/settings.json` | `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_MODEL`, `apiKeyHelper` |
-| Credentials | OS credential manager | Actual sk (DPAPI / Keychain / secret-service) |
+| Credentials | OS credential manager / `~/.local/share/ccms/` | Actual sk (DPAPI / Keychain / age / openssl / secret-service) |
 
 ### Credential Backend Abstraction
 
@@ -52,9 +52,13 @@ Platform-specific backends are hidden behind `cred_store(cred, sk)` / `cred_retr
 
 - **Windows**: `advapi32.CredReadW/WriteW` via ctypes (`_CREDENTIALW` struct)
 - **macOS**: `security` CLI subprocess
-- **Linux**: `secret-tool` CLI subprocess
+- **Linux (GUI)**: `secret-tool` CLI subprocess (secret-service / libsecret)
+- **Linux (headless, preferred)**: `age` CLI — encrypts with key pair at `~/.local/share/ccms/identity.age`
+- **Linux (headless, fallback)**: `openssl enc` CLI — AES-256-CBC with key file at `~/.local/share/ccms/ccms.key`
 
-The `credential` dict in `custom-models.json` carries backend-specific params (e.g. `{"type": "wincred", "target": "claude/<alias>"}`).
+Linux backend selection: `_is_gui_session()` checks `$DISPLAY` / `$WAYLAND_DISPLAY`. GUI → secret-service. Headless → age (if installed) → linux-file/openssl.
+
+The `credential` dict in `custom-models.json` carries backend-specific params (e.g. `{"type": "age", "identity": "~/.local/share/ccms/identity.age", "keyname": "alias"}`).
 
 ### apiKeyHelper Mechanism
 

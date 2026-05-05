@@ -215,6 +215,12 @@ def _press_enter(prompt_text: str = "按 Enter 返回菜单..."):
 CRED_WINCRED = "wincred"
 CRED_MACOS_KEYCHAIN = "macos-keychain"
 CRED_SECRET_SERVICE = "secret-service"
+CRED_AGE = "age"
+CRED_LINUX_FILE = "linux-file"
+
+CCMS_CRED_DIR = os.path.expanduser("~/.local/share/ccms")
+CCMS_AGE_IDENTITY_DEFAULT = os.path.join(CCMS_CRED_DIR, "identity.age")
+CCMS_FILE_KEY_DEFAULT = os.path.join(CCMS_CRED_DIR, "ccms.key")
 
 def _detect_platform() -> str:
     """返回当前 OS 标识: windows / macos / linux"""
@@ -223,18 +229,27 @@ def _detect_platform() -> str:
     if s == "darwin": return "macos"
     return "linux"
 
+def _is_gui_session() -> bool:
+    """检测是否有 GUI 会话（X11 或 Wayland）。"""
+    return bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+
 def cred_available_backends() -> list[str]:
     """返回当前 OS 可用的凭据后端列表"""
     plat = _detect_platform()
     if plat == "windows": return [CRED_WINCRED]
     if plat == "macos":   return [CRED_MACOS_KEYCHAIN]
-    # Linux: 检测 secret-tool 是否可用
+    # Linux
+    backends = []
     try:
         subprocess.run(["secret-tool", "--version"],
                        capture_output=True, timeout=3)
-        return [CRED_SECRET_SERVICE]
+        backends.append(CRED_SECRET_SERVICE)
     except Exception:
-        return []
+        pass
+    if shutil.which("age"):
+        backends.append(CRED_AGE)
+    backends.append(CRED_LINUX_FILE)  # openssl 几乎总是可用
+    return backends
 
 def cred_default_config(model_name: str) -> dict:
     """为当前 OS 生成默认的 credential 配置"""
@@ -244,9 +259,27 @@ def cred_default_config(model_name: str) -> dict:
     elif plat == "macos":
         return {"type": CRED_MACOS_KEYCHAIN, "service": "claude",
                 "account": model_name}
-    else:
-        return {"type": CRED_SECRET_SERVICE, "label": f"claude/{model_name}",
-                "key": f"claude-{model_name}"}
+    # Linux
+    # GUI 会话 + secret-tool 可用 → secret-service
+    if _is_gui_session():
+        try:
+            subprocess.run(["secret-tool", "--version"],
+                           capture_output=True, timeout=3)
+            return {"type": CRED_SECRET_SERVICE,
+                    "label": f"claude/{model_name}",
+                    "key": f"claude-{model_name}"}
+        except Exception:
+            pass
+    # age 可用 → age
+    if shutil.which("age"):
+        identity = _age_resolve_identity(autocreate=True)
+        if identity:
+            return {"type": CRED_AGE, "identity": identity,
+                    "keyname": model_name}
+    # fallback → linux-file (openssl)
+    identity = _linux_file_resolve_identity(autocreate=True)
+    return {"type": CRED_LINUX_FILE, "identity": identity,
+            "keyname": model_name}
 
 def cred_store(cred: dict, sk: str):
     """将 sk 存入凭据后端"""
@@ -257,6 +290,10 @@ def cred_store(cred: dict, sk: str):
         _macos_keychain_store(cred["service"], cred["account"], sk)
     elif t == CRED_SECRET_SERVICE:
         _secret_service_store(cred.get("key"), cred.get("label", ""), sk)
+    elif t == CRED_AGE:
+        _age_store(cred["identity"], cred["keyname"], sk)
+    elif t == CRED_LINUX_FILE:
+        _linux_file_store(cred["identity"], cred["keyname"], sk)
     else:
         raise ValueError(f"未知凭据后端: {t}")
 
@@ -270,6 +307,10 @@ def cred_retrieve(cred: dict) -> str | None:
             return _macos_keychain_retrieve(cred["service"], cred["account"])
         elif t == CRED_SECRET_SERVICE:
             return _secret_service_retrieve(cred.get("key"))
+        elif t == CRED_AGE:
+            return _age_retrieve(cred["identity"], cred["keyname"])
+        elif t == CRED_LINUX_FILE:
+            return _linux_file_retrieve(cred["identity"], cred["keyname"])
     except Exception:
         return None
     return None
@@ -283,6 +324,10 @@ def cred_delete(cred: dict):
         _macos_keychain_delete(cred["service"], cred["account"])
     elif t == CRED_SECRET_SERVICE:
         _secret_service_delete(cred.get("key"))
+    elif t == CRED_AGE:
+        _age_delete(cred["keyname"])
+    elif t == CRED_LINUX_FILE:
+        _linux_file_delete(cred["keyname"])
 
 # ---- Windows Credential Manager (advapi32) ----
 
@@ -366,78 +411,31 @@ def _macos_keychain_delete(service: str, account: str):
 
 # ---- Linux secret-service (secret-tool) ----
 
-_CCMS_COLLECTION = "claude-code-models"
-
-
-def _try_start_keyring_daemon():
-    """如果守护进程没运行，尝试启动它。"""
-    # 检查进程
+def _try_start_keyring_daemon() -> bool:
+    """如果守护进程没运行，尝试启动它。返回是否成功。"""
     try:
         r = subprocess.run(["pidof", "gnome-keyring-daemon"],
                            capture_output=True, text=True, timeout=3)
         if r.returncode == 0 and r.stdout.strip():
-            return  # 已经在跑
+            return True
     except Exception:
         pass
-    # 尝试启动（通过 dbus-launch 可能已经在跑，直接 start）
     try:
-        subprocess.run(
+        r = subprocess.run(
             ["gnome-keyring-daemon", "--start",
              "--components=secrets", "--daemonize"],
             capture_output=True, text=True, timeout=10)
+        return r.returncode == 0
     except Exception:
-        pass
-
-
-def _ensure_ccms_collection() -> bool:
-    """确保 CCMS 专属 secret-service collection 存在且可读写。
-    创建 collection 不需要解锁 login，互不干扰。"""
-    _try_start_keyring_daemon()
-
-    for _round in range(2):  # 最多重试一次
-        try:
-            r = subprocess.run(
-                ["busctl", "call", "org.freedesktop.secrets",
-                 "/org/freedesktop/secrets",
-                 "org.freedesktop.Secret.Service",
-                 "CreateCollection", "a{sv}", "1",
-                 "org.freedesktop.Secret.Collection.Label", "s",
-                 _CCMS_COLLECTION],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                return True
-        except Exception:
-            pass
-        # busctl 不可用，尝试 gdbus
-        try:
-            r = subprocess.run(
-                ["gdbus", "call", "--session",
-                 "--dest", "org.freedesktop.secrets",
-                 "--object-path", "/org/freedesktop/secrets",
-                 "--method",
-                 "org.freedesktop.Secret.Service.CreateCollection",
-                 '{"org.freedesktop.Secret.Collection.Label": <"'
-                 + _CCMS_COLLECTION + '">}'],
-                capture_output=True, text=True, timeout=10)
-            if r.returncode == 0:
-                return True
-        except Exception:
-            pass
-        # 如果第一轮失败，再试着启动守护进程后重试
-        if _round == 0:
-            _try_start_keyring_daemon()
-
-    return False
+        return False
 
 
 def _secret_service_store(key: str | None, label: str, sk: str):
     if not key:
         key = label
-    _ensure_ccms_collection()
+    _try_start_keyring_daemon()
     r = subprocess.run(["secret-tool", "store",
-                        "--collection=" + _CCMS_COLLECTION,
-                        "--label", label,
-                        "key", key],
+                        "--label", label, "key", key],
                        input=sk, text=True, capture_output=True)
     if r.returncode != 0:
         err = r.stderr.strip() if r.stderr else "unknown error"
@@ -446,28 +444,147 @@ def _secret_service_store(key: str | None, label: str, sk: str):
 def _secret_service_retrieve(key: str | None) -> str | None:
     if not key:
         return None
-    r = subprocess.run(["secret-tool", "lookup",
-                        "--collection=" + _CCMS_COLLECTION,
-                        "key", key],
+    r = subprocess.run(["secret-tool", "lookup", "key", key],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        err = r.stderr.strip() if r.stderr else ""
-        if err:
-            print(f"secret-tool lookup warning: {err}", file=sys.stderr)
         return None
     return r.stdout.strip()
 
 def _secret_service_delete(key: str | None):
     if not key:
         return
-    r = subprocess.run(["secret-tool", "clear",
-                        "--collection=" + _CCMS_COLLECTION,
-                        "key", key],
-                       capture_output=True, text=True)
+    subprocess.run(["secret-tool", "clear", "key", key],
+                   capture_output=True, text=True)
+
+
+# ---- Linux age 后端 ----
+
+def _age_resolve_identity(*, autocreate: bool = False) -> str | None:
+    """返回 age 身份文件路径。autocreate=True 时自动生成。
+    优先级: $CCMS_AGE_IDENTITY → ~/.config/ccms/age-identity → 自动生成"""
+    # 1. 环境变量
+    env_id = os.environ.get("CCMS_AGE_IDENTITY")
+    if env_id:
+        p = os.path.expanduser(env_id)
+        if os.path.isfile(p):
+            return os.path.realpath(p)
+    # 2. 配置文件
+    cfg = os.path.expanduser("~/.config/ccms/age-identity")
+    if os.path.isfile(cfg):
+        with open(cfg) as f:
+            path = f.read().strip()
+        if path:
+            p = os.path.expanduser(path)
+            if os.path.isfile(p):
+                return os.path.realpath(p)
+    # 3. 默认路径
+    default = os.path.realpath(os.path.expanduser(CCMS_AGE_IDENTITY_DEFAULT))
+    if os.path.isfile(default):
+        return default
+    # 4. 自动生成
+    if autocreate:
+        os.makedirs(os.path.dirname(default), exist_ok=True)
+        r = subprocess.run(["age-keygen", "-o", default],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            os.chmod(default, 0o600)
+            return default
+    return None
+
+
+def _age_store(identity: str, keyname: str, sk: str):
+    """用 age 加密 sk 并存储到文件。"""
+    cred_dir = os.path.join(CCMS_CRED_DIR, "creds")
+    os.makedirs(cred_dir, exist_ok=True)
+    cred_path = os.path.join(cred_dir, f"{keyname}.age")
+
+    # 从身份文件提取公钥
+    r = subprocess.run(["age-keygen", "-y", identity],
+                       capture_output=True, text=True, timeout=10)
     if r.returncode != 0:
-        err = r.stderr.strip() if r.stderr else ""
-        if err:
-            print(f"secret-tool clear warning: {err}", file=sys.stderr)
+        raise RuntimeError(f"age-keygen 失败: {r.stderr.strip()}")
+    pubkey = r.stdout.strip()
+
+    # 加密（二进制输出，不能用 text=True）
+    r = subprocess.run(["age", "-e", "-r", pubkey],
+                       input=sk.encode(), capture_output=True, timeout=10)
+    if r.returncode != 0:
+        err = r.stderr.decode().strip() if r.stderr else "unknown error"
+        raise RuntimeError(f"age 加密失败: {err}")
+
+    with open(cred_path, "wb") as f:
+        f.write(r.stdout)
+
+def _age_retrieve(identity: str, keyname: str) -> str | None:
+    """解密 age 加密文件并返回 sk。"""
+    cred_path = os.path.join(CCMS_CRED_DIR, "creds", f"{keyname}.age")
+    if not os.path.isfile(cred_path):
+        return None
+    with open(cred_path, "rb") as f:
+        encrypted = f.read()
+    r = subprocess.run(["age", "-d", "-i", identity],
+                       input=encrypted, capture_output=True, timeout=10)
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode().strip()
+
+def _age_delete(keyname: str):
+    cred_path = os.path.join(CCMS_CRED_DIR, "creds", f"{keyname}.age")
+    if os.path.isfile(cred_path):
+        os.remove(cred_path)
+
+
+# ---- Linux 文件加密后端 (openssl fallback) ----
+
+def _linux_file_resolve_identity(*, autocreate: bool = False) -> str | None:
+    """返回 openssl 密钥文件路径。autocreate=True 时自动生成随机密钥。"""
+    default = os.path.realpath(os.path.expanduser(CCMS_FILE_KEY_DEFAULT))
+    if os.path.isfile(default):
+        return default
+    if autocreate:
+        os.makedirs(os.path.dirname(default), exist_ok=True)
+        r = subprocess.run(["openssl", "rand", "-hex", "32"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            with open(default, "w") as f:
+                f.write(r.stdout.strip())
+            os.chmod(default, 0o600)
+            return default
+    return None
+
+def _linux_file_store(identity: str, keyname: str, sk: str):
+    """用 openssl aes-256-cbc 加密 sk 并存储。"""
+    cred_dir = os.path.join(CCMS_CRED_DIR, "creds")
+    os.makedirs(cred_dir, exist_ok=True)
+    cred_path = os.path.join(cred_dir, f"{keyname}.enc")
+    r = subprocess.run(
+        ["openssl", "enc", "-aes-256-cbc", "-pbkdf2",
+         "-pass", f"file:{identity}"],
+        input=sk, text=True, capture_output=True, timeout=10)
+    if r.returncode != 0:
+        raise RuntimeError(f"openssl 加密失败: {r.stderr.strip()}")
+    with open(cred_path, "wb") as f:
+        f.write(r.stdout)
+
+def _linux_file_retrieve(identity: str, keyname: str) -> str | None:
+    """解密 openssl 加密文件并返回 sk。"""
+    cred_path = os.path.join(CCMS_CRED_DIR, "creds", f"{keyname}.enc")
+    if not os.path.isfile(cred_path):
+        return None
+    with open(cred_path, "rb") as f:
+        encrypted = f.read()
+    r = subprocess.run(
+        ["openssl", "enc", "-d", "-aes-256-cbc", "-pbkdf2",
+         "-pass", f"file:{identity}"],
+        input=encrypted, capture_output=True, timeout=10)
+    if r.returncode != 0:
+        return None
+    return r.stdout.decode().strip()
+
+def _linux_file_delete(keyname: str):
+    cred_path = os.path.join(CCMS_CRED_DIR, "creds", f"{keyname}.enc")
+    if os.path.isfile(cred_path):
+        os.remove(cred_path)
 
 # ============================================================
 # 模型数据读写
@@ -817,17 +934,17 @@ def detect_env_api_key_conflict():
 
 
 def _is_secret_service_locked() -> bool:
-    """检测 Linux secret-service 后端是否存在但 CCMS collection 被锁。"""
+    """检测 secret-service 后端是否被锁定。"""
     try:
         r = subprocess.run(
-            ["secret-tool", "lookup",
-             "--collection=" + _CCMS_COLLECTION,
-             "key", "ccms-health-check"],
+            ["secret-tool", "lookup", "key", "ccms-health-check"],
             capture_output=True, text=True, timeout=3)
         if r.returncode != 0:
             err = (r.stderr or "").lower()
-            return "locked" in err or "unavailable" in err
+            return "locked" in err
         return False
+    except subprocess.TimeoutExpired:
+        return True
     except Exception:
         return False
 
@@ -930,15 +1047,19 @@ def get_env_info_lines() -> list[tuple[str, str]]:
     backends = cred_available_backends()
     backend_labels = {CRED_WINCRED: "Windows Credential Manager",
                       CRED_MACOS_KEYCHAIN: "macOS Keychain",
-                      CRED_SECRET_SERVICE: "secret-service (libsecret)"}
+                      CRED_SECRET_SERVICE: "secret-service (libsecret)",
+                      CRED_AGE: "age 加密",
+                      CRED_LINUX_FILE: "linux-file (openssl)"}
     blabels = [backend_labels.get(b, b) for b in backends]
     backend_status = ", ".join(blabels) if blabels else "无"
     backend_color = "green" if blabels else "red"
     lines.append(("凭据后端", backend_status, backend_color))
     if plat == "linux" and not backends:
-        lines.append(("", "安装 libsecret-tools: apt install libsecret-tools", "red"))
-    elif plat == "linux" and backends and _is_secret_service_locked():
-        lines.append(("", "keyring 被锁定，运行: gnome-keyring-daemon --unlock", "yellow"))
+        lines.append(("", "无可用凭据后端，请安装 libsecret-tools 或 age", "red"))
+    if CRED_AGE in backends and not _age_resolve_identity():
+        lines.append(("", "age 身份文件未配置（首次添加模型时自动生成）", "yellow"))
+    if CRED_SECRET_SERVICE in backends and _is_secret_service_locked():
+        lines.append(("", "secret-service 被锁定（GUI 环境可解锁）", "yellow"))
 
     # ── 当前项目 (.claude/) ──
     lines.append(("项目路径", os.getcwd(), ""))
@@ -1120,7 +1241,6 @@ def main():
                     if not _unlock_linux_keyring():
                         _press_enter()
                         continue
-                    # 解锁成功，重试存储
                     try:
                         cred_store(cred, sk)
                     except Exception as ex:
@@ -1134,15 +1254,22 @@ def main():
                     _print_color(
                         "\n⚠  secret-service 服务不可用 (D-Bus 超时)\n",
                         color="\033[33m")
-                    _print_color(
-                        "   gnome-keyring-daemon 可能未运行\n", dim=True)
                     print("  eval $(gnome-keyring-daemon --start "
                           "--components=secrets --daemonize)")
                     print("  export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK")
                     _press_enter()
                     continue
                 else:
-                    raise
+                    _print_color(f"\n✘ 凭据存储失败: {e}\n",
+                                 color="\033[31m")
+                    _press_enter()
+                    continue
+            except FileNotFoundError as e:
+                _print_color(f"\n✘ 未找到加密工具: {e.filename or e}\n"
+                             f"   请安装 age: sudo apt install age\n",
+                             color="\033[31m")
+                _press_enter()
+                continue
             models[alias] = {"url": url, "modelName": mn, "credential": cred}
             save_custom_models(models)
             _print_color(f"✔ 模型 \"{alias}\" → {mn} 已保存\n", color="\033[32m")
