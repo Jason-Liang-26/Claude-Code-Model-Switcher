@@ -719,6 +719,18 @@ def detect_env_api_key_conflict():
         conflicts.append(("用户", os.path.expanduser("~/.claude/settings.json")))
     return conflicts
 
+
+def is_global_config_dir() -> bool:
+    """检查 CWD 是否为用户家目录。
+    若是，项目级 .claude/settings.json 与用户级 ~/.claude/settings.json 是同一文件，
+    切换模型会修改全局配置。"""
+    try:
+        cwd = os.path.normcase(os.path.realpath(os.getcwd()))
+        home = os.path.normcase(os.path.realpath(os.path.expanduser("~")))
+        return cwd == home
+    except Exception:
+        return False
+
 # ============================================================
 # 环境信息显示
 # ============================================================
@@ -794,7 +806,10 @@ def main():
         # 当前目录
         cwd = os.getcwd()
         _print_color("  📁 当前目录: ", dim=True)
-        _print_color(f"{cwd}\n\n", dim=True)
+        _print_color(f"{cwd}\n", dim=True)
+        if is_global_config_dir():
+            _print_color("  ⚠  当前处于全局配置目录，切换模型会影响全局配置\n", color="\033[31m", bold=True)
+        print()
 
         # 渲染环境信息，按分区展示
         info = get_env_info_lines()
@@ -878,6 +893,11 @@ def main():
                     save_custom_models(models)
                 else:
                     continue
+            if is_global_config_dir():
+                _print_color(f"\n⚠  当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
+                _print_color(f"   切换模型 \"{alias}\" 会修改全局 ~/.claude/settings.json，影响所有未配置的项目\n", color="\033[33m")
+                if not confirm("确定要继续吗？", default_no=True):
+                    continue
             write_model_to_project(alias, cfg)
             current = alias
             mn = cfg.get("modelName", alias)
@@ -907,10 +927,16 @@ def main():
             _print_color(f"✔ 模型 \"{alias}\" → {mn} 已保存\n", color="\033[32m")
 
             if confirm("立即切换到该模型吗？"):
-                write_model_to_project(alias, models[alias])
-                current = alias
-                _print_color(f"✔ 已切换至: {alias} (modelName: {mn})\n", color="\033[32m")
-                print_env_export(alias, models[alias])
+                proceed = True
+                if is_global_config_dir():
+                    _print_color(f"\n⚠  当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
+                    _print_color(f"   切换会修改全局 ~/.claude/settings.json\n", color="\033[33m")
+                    proceed = confirm("确定要继续吗？", default_no=True)
+                if proceed:
+                    write_model_to_project(alias, models[alias])
+                    current = alias
+                    _print_color(f"✔ 已切换至: {alias} (modelName: {mn})\n", color="\033[32m")
+                    print_env_export(alias, models[alias])
 
             _press_enter()
             continue
