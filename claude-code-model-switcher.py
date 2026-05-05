@@ -510,14 +510,18 @@ def _generate_helper_scripts():
 
     root = os.getcwd()
     py = sys.executable
+    # 主脚本实际路径（安装后可能在 ~/.local/lib/，不一定是 CWD）
+    script_path = os.path.abspath(__file__)
 
     # ── PowerShell 版 (get-sk.ps1) ──
     # 用正斜杠避免 Python -c 参数里的反斜杠被当成转义符
     root_ps1 = root.replace("\\", "/")
+    script_ps1 = script_path.replace("\\", "/")
     ps1 = textwrap.dedent(f"""\
     # Claude Code apiKeyHelper — 由 claude-code-model-switcher.py 自动维护
     param($ModelArg)
     $root = "{root_ps1}"
+    $script = "{script_ps1}"
     $py = "{py}"
     if (-not $ModelArg) {{
         $ModelArg = & $py -c "
@@ -527,7 +531,7 @@ def _generate_helper_scripts():
     " 2>$null
     }}
     if (-not $ModelArg) {{ exit 1 }}
-    $sk = & $py "$root/claude-code-model-switcher.py" --get-sk $ModelArg 2>$null
+    $sk = & $py "$script" --get-sk $ModelArg 2>$null
     Write-Output $sk
     """)
     with open(os.path.join(helper_dir, "get-sk.ps1"), "w", encoding="utf-8") as f:
@@ -543,12 +547,17 @@ def _generate_helper_scripts():
     if len(py_nix) > 1 and py_nix[1] == ":":
         drive = py_nix[0].lower()
         py_nix = f"/mnt/{drive}{py_nix[2:]}"
+    script_nix = script_path.replace("\\", "/")
+    if len(script_nix) > 1 and script_nix[1] == ":":
+        drive = script_nix[0].lower()
+        script_nix = f"/mnt/{drive}{script_nix[2:]}"
 
     sh = textwrap.dedent(f"""\
     #!/bin/bash
     # Claude Code apiKeyHelper — 由 claude-code-model-switcher.py 自动维护
     set -euo pipefail
     SELF_DIR="{root_nix}"
+    SCRIPT="{script_nix}"
     _PY=""
     for _p in "{py_nix}" python3 python; do
         if command -v "$_p" >/dev/null 2>&1; then
@@ -566,7 +575,7 @@ def _generate_helper_scripts():
     " 2>/dev/null || echo "")
     fi
     [ -z "$MODEL" ] && exit 1
-    exec "$_PY" "$SELF_DIR/claude-code-model-switcher.py" --get-sk "$MODEL"
+    exec "$_PY" "$SCRIPT" --get-sk "$MODEL"
     """)
     with open(os.path.join(helper_dir, "get-sk.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(sh)
