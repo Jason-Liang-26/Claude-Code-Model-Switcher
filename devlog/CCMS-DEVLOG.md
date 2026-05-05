@@ -137,6 +137,18 @@
 
 ---
 
+## Phase 8: 全局配置目录安全检测 (v0.8)
+
+**目标**：防止在用户家目录下运行时，模型切换无声改写全局配置
+
+**实现**：
+- `is_global_config_dir()`：通过 `realpath + normcase` 精确判断 CWD 是否等于 `~`
+- 主菜单顶部显示红色加粗警告：`当前处于全局配置目录，切换模型会影响全局配置`
+- "切换模型" 和 "添加模型 → 立即切换" 流程在执行写入前增加二次确认（默认 No）
+- CLI 模式（`--env` / `--get-sk`）无变更，避免破坏自动化调用
+
+---
+
 ## 产物清单
 
 | 文件 | 说明 |
@@ -146,5 +158,5 @@
 | `install.cmd` | 安装器 (CMD) |
 | `install.ps1` | 安装器 (PowerShell) |
 | `CCMS-SPEC.md` | 规格文档 |
-| `CCMS-DEVLOG.md` | 本文档 |
+| `devlog/CCMS-DEVLOG.md` | 本文档 |
 | `claude-code-model-switcher-help.md` | 用户手册 |
