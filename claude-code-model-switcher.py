@@ -745,6 +745,19 @@ def detect_env_api_key_conflict():
     return conflicts
 
 
+def _is_secret_service_locked() -> bool:
+    """检测 Linux secret-service 后端是否存在但 collection 被锁。"""
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "key", "ccms-health-check"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode != 0:
+            err = (r.stderr or "").lower()
+            return "locked" in err or "unavailable" in err
+        return False
+    except Exception:
+        return False
+
+
 def is_global_config_dir() -> bool:
     """检查 CWD 是否为用户家目录。
     若是，项目级 .claude/settings.json 与用户级 ~/.claude/settings.json 是同一文件，
@@ -779,6 +792,8 @@ def get_env_info_lines() -> list[tuple[str, str]]:
     lines.append(("凭据后端", backend_status, backend_color))
     if plat == "linux" and not backends:
         lines.append(("", "安装 libsecret-tools: apt install libsecret-tools", "red"))
+    elif plat == "linux" and backends and _is_secret_service_locked():
+        lines.append(("", "keyring 被锁定，运行: gnome-keyring-daemon --unlock", "yellow"))
 
     # ── 当前项目 (.claude/) ──
     lines.append(("项目路径", os.getcwd(), ""))
@@ -948,7 +963,17 @@ def main():
                     continue
 
             cred = cred_default_config(alias)
-            cred_store(cred, sk)
+            try:
+                cred_store(cred, sk)
+            except RuntimeError as e:
+                if "locked" in str(e).lower():
+                    _print_color("\n⚠  凭据后端被锁定，无法存储 API Key\n", color="\033[33m")
+                    _print_color("   请先解锁 keyring:\n", dim=True)
+                    print("     gnome-keyring-daemon --unlock")
+                    print("     # 输入你的 keyring 密码")
+                    _press_enter()
+                    continue
+                raise
             models[alias] = {"url": url, "modelName": mn, "credential": cred}
             save_custom_models(models)
             _print_color(f"✔ 模型 \"{alias}\" → {mn} 已保存\n", color="\033[32m")
