@@ -366,10 +366,45 @@ def _macos_keychain_delete(service: str, account: str):
 
 # ---- Linux secret-service (secret-tool) ----
 
+_CCMS_COLLECTION = "claude-code-models"
+
+
+def _ensure_ccms_collection() -> bool:
+    """确保 CCMS 专属 secret-service collection 存在且可读写。
+    创建 collection 不需要解锁 login，互不干扰。"""
+    try:
+        subprocess.run(
+            ["busctl", "call", "org.freedesktop.secrets",
+             "/org/freedesktop/secrets",
+             "org.freedesktop.Secret.Service",
+             "CreateCollection", "a{sv}", "1",
+             "org.freedesktop.Secret.Collection.Label", "s",
+             _CCMS_COLLECTION],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        # busctl 不可用，尝试 gdbus
+        try:
+            subprocess.run(
+                ["gdbus", "call", "--session",
+                 "--dest", "org.freedesktop.secrets",
+                 "--object-path", "/org/freedesktop/secrets",
+                 "--method",
+                 "org.freedesktop.Secret.Service.CreateCollection",
+                 '{"org.freedesktop.Secret.Collection.Label": <"'
+                 + _CCMS_COLLECTION + '">}'],
+                capture_output=True, text=True, timeout=10)
+        except Exception:
+            return False
+    return True
+
+
 def _secret_service_store(key: str | None, label: str, sk: str):
     if not key:
         key = label
-    r = subprocess.run(["secret-tool", "store", "--label", label,
+    _ensure_ccms_collection()
+    r = subprocess.run(["secret-tool", "store",
+                        "--collection=" + _CCMS_COLLECTION,
+                        "--label", label,
                         "key", key],
                        input=sk, text=True, capture_output=True)
     if r.returncode != 0:
@@ -379,7 +414,9 @@ def _secret_service_store(key: str | None, label: str, sk: str):
 def _secret_service_retrieve(key: str | None) -> str | None:
     if not key:
         return None
-    r = subprocess.run(["secret-tool", "lookup", "key", key],
+    r = subprocess.run(["secret-tool", "lookup",
+                        "--collection=" + _CCMS_COLLECTION,
+                        "key", key],
                        capture_output=True, text=True)
     if r.returncode != 0:
         err = r.stderr.strip() if r.stderr else ""
@@ -391,7 +428,9 @@ def _secret_service_retrieve(key: str | None) -> str | None:
 def _secret_service_delete(key: str | None):
     if not key:
         return
-    r = subprocess.run(["secret-tool", "clear", "key", key],
+    r = subprocess.run(["secret-tool", "clear",
+                        "--collection=" + _CCMS_COLLECTION,
+                        "key", key],
                        capture_output=True, text=True)
     if r.returncode != 0:
         err = r.stderr.strip() if r.stderr else ""
@@ -746,10 +785,13 @@ def detect_env_api_key_conflict():
 
 
 def _is_secret_service_locked() -> bool:
-    """检测 Linux secret-service 后端是否存在但 collection 被锁。"""
+    """检测 Linux secret-service 后端是否存在但 CCMS collection 被锁。"""
     try:
-        r = subprocess.run(["secret-tool", "lookup", "key", "ccms-health-check"],
-                           capture_output=True, text=True, timeout=3)
+        r = subprocess.run(
+            ["secret-tool", "lookup",
+             "--collection=" + _CCMS_COLLECTION,
+             "key", "ccms-health-check"],
+            capture_output=True, text=True, timeout=3)
         if r.returncode != 0:
             err = (r.stderr or "").lower()
             return "locked" in err or "unavailable" in err
