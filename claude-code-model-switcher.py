@@ -369,22 +369,48 @@ def _macos_keychain_delete(service: str, account: str):
 _CCMS_COLLECTION = "claude-code-models"
 
 
+def _try_start_keyring_daemon():
+    """如果守护进程没运行，尝试启动它。"""
+    # 检查进程
+    try:
+        r = subprocess.run(["pidof", "gnome-keyring-daemon"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            return  # 已经在跑
+    except Exception:
+        pass
+    # 尝试启动（通过 dbus-launch 可能已经在跑，直接 start）
+    try:
+        subprocess.run(
+            ["gnome-keyring-daemon", "--start",
+             "--components=secrets", "--daemonize"],
+            capture_output=True, text=True, timeout=10)
+    except Exception:
+        pass
+
+
 def _ensure_ccms_collection() -> bool:
     """确保 CCMS 专属 secret-service collection 存在且可读写。
     创建 collection 不需要解锁 login，互不干扰。"""
-    try:
-        subprocess.run(
-            ["busctl", "call", "org.freedesktop.secrets",
-             "/org/freedesktop/secrets",
-             "org.freedesktop.Secret.Service",
-             "CreateCollection", "a{sv}", "1",
-             "org.freedesktop.Secret.Collection.Label", "s",
-             _CCMS_COLLECTION],
-            capture_output=True, text=True, timeout=10)
-    except Exception:
+    _try_start_keyring_daemon()
+
+    for _round in range(2):  # 最多重试一次
+        try:
+            r = subprocess.run(
+                ["busctl", "call", "org.freedesktop.secrets",
+                 "/org/freedesktop/secrets",
+                 "org.freedesktop.Secret.Service",
+                 "CreateCollection", "a{sv}", "1",
+                 "org.freedesktop.Secret.Collection.Label", "s",
+                 _CCMS_COLLECTION],
+                capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
         # busctl 不可用，尝试 gdbus
         try:
-            subprocess.run(
+            r = subprocess.run(
                 ["gdbus", "call", "--session",
                  "--dest", "org.freedesktop.secrets",
                  "--object-path", "/org/freedesktop/secrets",
@@ -393,9 +419,15 @@ def _ensure_ccms_collection() -> bool:
                  '{"org.freedesktop.Secret.Collection.Label": <"'
                  + _CCMS_COLLECTION + '">}'],
                 capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                return True
         except Exception:
-            return False
-    return True
+            pass
+        # 如果第一轮失败，再试着启动守护进程后重试
+        if _round == 0:
+            _try_start_keyring_daemon()
+
+    return False
 
 
 def _secret_service_store(key: str | None, label: str, sk: str):
@@ -1079,7 +1111,8 @@ def main():
             try:
                 cred_store(cred, sk)
             except RuntimeError as e:
-                if "locked" in str(e).lower():
+                err_lower = str(e).lower()
+                if "locked" in err_lower:
                     _print_color("\n⚠  凭据后端被锁定\n", color="\033[33m")
                     if not confirm("要解锁 Keyring 吗？"):
                         _press_enter()
@@ -1096,6 +1129,18 @@ def main():
                             color="\033[31m")
                         _press_enter()
                         continue
+                elif "timeout" in err_lower or \
+                     "startservicebyname" in err_lower:
+                    _print_color(
+                        "\n⚠  secret-service 服务不可用 (D-Bus 超时)\n",
+                        color="\033[33m")
+                    _print_color(
+                        "   gnome-keyring-daemon 可能未运行\n", dim=True)
+                    print("  eval $(gnome-keyring-daemon --start "
+                          "--components=secrets --daemonize)")
+                    print("  export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK")
+                    _press_enter()
+                    continue
                 else:
                     raise
             models[alias] = {"url": url, "modelName": mn, "credential": cred}
