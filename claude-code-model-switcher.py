@@ -369,9 +369,12 @@ def _macos_keychain_delete(service: str, account: str):
 def _secret_service_store(key: str | None, label: str, sk: str):
     if not key:
         key = label
-    subprocess.run(["secret-tool", "store", "--label", label,
-                    "key", key],
-                   input=sk, text=True, capture_output=True, check=True)
+    r = subprocess.run(["secret-tool", "store", "--label", label,
+                        "key", key],
+                       input=sk, text=True, capture_output=True)
+    if r.returncode != 0:
+        err = r.stderr.strip() if r.stderr else "unknown error"
+        raise RuntimeError(f"secret-tool store failed: {err}")
 
 def _secret_service_retrieve(key: str | None) -> str | None:
     if not key:
@@ -379,14 +382,21 @@ def _secret_service_retrieve(key: str | None) -> str | None:
     r = subprocess.run(["secret-tool", "lookup", "key", key],
                        capture_output=True, text=True)
     if r.returncode != 0:
+        err = r.stderr.strip() if r.stderr else ""
+        if err:
+            print(f"secret-tool lookup warning: {err}", file=sys.stderr)
         return None
     return r.stdout.strip()
 
 def _secret_service_delete(key: str | None):
     if not key:
         return
-    subprocess.run(["secret-tool", "clear", "key", key],
-                   capture_output=True)
+    r = subprocess.run(["secret-tool", "clear", "key", key],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        err = r.stderr.strip() if r.stderr else ""
+        if err:
+            print(f"secret-tool clear warning: {err}", file=sys.stderr)
 
 # ============================================================
 # 模型数据读写
