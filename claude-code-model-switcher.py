@@ -395,7 +395,8 @@ def _json_strip_trailing_commas(text: str) -> str:
 def load_custom_models() -> dict:
     if not os.path.isfile(CUSTOM_MODELS_PATH):
         return {}
-    raw = open(CUSTOM_MODELS_PATH, "r", encoding="utf-8").read()
+    with open(CUSTOM_MODELS_PATH, "r", encoding="utf-8") as f:
+        raw = f.read()
     try:
         return json.loads(raw)
     except json.JSONDecodeError:
