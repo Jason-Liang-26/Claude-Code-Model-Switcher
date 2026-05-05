@@ -59,12 +59,15 @@ def _setup_console():
     # Unix / WSL: termios
     try:
         import termios
-        import tty
         import atexit
         fd = sys.stdin.fileno()
         old = termios.tcgetattr(fd)
         atexit.register(lambda: termios.tcsetattr(fd, termios.TCSADRAIN, old))
-        tty.setraw(fd)
+        new = termios.tcgetattr(fd)
+        # 关闭回显、规范模式（行缓冲）、扩展模式、信号
+        # 保留 c_oflag（输出处理），避免 \n 失去回车行首效果
+        new[3] = new[3] & ~(termios.ECHO | termios.ICANON | termios.IEXTEN | termios.ISIG)
+        termios.tcsetattr(fd, termios.TCSADRAIN, new)
         return
     except Exception:
         pass
