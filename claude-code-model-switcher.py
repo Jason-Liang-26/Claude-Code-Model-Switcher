@@ -758,6 +758,72 @@ def _is_secret_service_locked() -> bool:
         return False
 
 
+def _unlock_linux_keyring() -> bool:
+    """在 Linux 上交互式解锁 keyring collection。
+
+    找到 gnome-keyring 控制套接字，用 CCMS 自己的提示符获取密码，
+    通过 subprocess 传给 gnome-keyring-daemon --unlock。"""
+    if _detect_platform() != "linux":
+        return False
+
+    # 1. 找到控制套接字
+    control = os.environ.get("GNOME_KEYRING_CONTROL", "")
+    if not control:
+        try:
+            default_path = f"/run/user/{os.getuid()}/keyring/control"
+            if os.path.exists(default_path):
+                control = default_path
+        except Exception:
+            pass
+
+    if not control:
+        # 尝试通过 gnome-keyring-daemon --start 获取
+        try:
+            r = subprocess.run(
+                ["gnome-keyring-daemon", "--start",
+                 "--components=secrets"],
+                capture_output=True, text=True, timeout=10)
+            for line in (r.stdout + "\n" + r.stderr).split("\n"):
+                if "GNOME_KEYRING_CONTROL=" in line:
+                    control = line.split("=", 1)[1].strip()
+        except Exception:
+            pass
+
+    if not control or not os.path.exists(control):
+        _print_color("✘ 无法连接 gnome-keyring 守护进程\n",
+                     color="\033[31m")
+        return False
+
+    # 2. 获取密码并解锁
+    _print_color("\n解锁 Keyring\n", bold=True)
+    _print_color("（没有设置过密码则直接回车）\n", dim=True)
+    password = input_with_prompt("Keyring 密码: ")
+
+    try:
+        r = subprocess.run(
+            ["gnome-keyring-daemon", "--unlock"],
+            input=password + "\n",
+            text=True,
+            capture_output=True,
+            timeout=15,
+            env={**os.environ, "GNOME_KEYRING_CONTROL": control})
+    except subprocess.TimeoutExpired:
+        _print_color("✘ 解锁超时\n", color="\033[31m")
+        return False
+
+    if r.returncode == 0:
+        _print_color("✔ Keyring 已解锁\n", color="\033[32m")
+        return True
+
+    err = (r.stderr or "").strip()
+    if "invalid" in err.lower():
+        _print_color("✘ 密码错误\n", color="\033[31m")
+    else:
+        _print_color(f"✘ 解锁失败: {err or '未知错误'}\n",
+                     color="\033[31m")
+    return False
+
+
 def is_global_config_dir() -> bool:
     """检查 CWD 是否为用户家目录。
     若是，项目级 .claude/settings.json 与用户级 ~/.claude/settings.json 是同一文件，
@@ -967,13 +1033,24 @@ def main():
                 cred_store(cred, sk)
             except RuntimeError as e:
                 if "locked" in str(e).lower():
-                    _print_color("\n⚠  凭据后端被锁定，无法存储 API Key\n", color="\033[33m")
-                    _print_color("   请先解锁 keyring:\n", dim=True)
-                    print("     gnome-keyring-daemon --unlock")
-                    print("     # 输入你的 keyring 密码")
-                    _press_enter()
-                    continue
-                raise
+                    _print_color("\n⚠  凭据后端被锁定\n", color="\033[33m")
+                    if not confirm("要解锁 Keyring 吗？"):
+                        _press_enter()
+                        continue
+                    if not _unlock_linux_keyring():
+                        _press_enter()
+                        continue
+                    # 解锁成功，重试存储
+                    try:
+                        cred_store(cred, sk)
+                    except Exception as ex:
+                        _print_color(
+                            f"✘ 存储凭据仍然失败: {ex}\n",
+                            color="\033[31m")
+                        _press_enter()
+                        continue
+                else:
+                    raise
             models[alias] = {"url": url, "modelName": mn, "credential": cred}
             save_custom_models(models)
             _print_color(f"✔ 模型 \"{alias}\" → {mn} 已保存\n", color="\033[32m")
