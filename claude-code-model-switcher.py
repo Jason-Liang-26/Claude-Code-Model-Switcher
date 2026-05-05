@@ -79,7 +79,9 @@ def _getch():
     except Exception:
         pass
     try:
-        return sys.stdin.read(1)
+        ch = sys.stdin.read(1)
+        # EOF (empty string) → treat as Ctrl+C to avoid infinite loops
+        return ch if ch else "\x03"
     except Exception:
         return "\x03"
 
@@ -141,7 +143,7 @@ def select_from_list(items: list[str], title: str = "",
         elif ch in ("\r", "\n"):
             _clear_lines(total_display)
             return selected
-        elif ch == "\x03":
+        elif ch == "\x03" or not ch:
             _clear_lines(total_display)
             raise KeyboardInterrupt
         else:
@@ -197,7 +199,7 @@ def _press_enter(prompt_text: str = "按 Enter 返回菜单..."):
         ch = _getch()
         if ch in ("\r", "\n"):
             return
-        elif ch == "\x1b":
+        elif ch == "\x1b" or not ch:
             return
         elif ch == "\x03":
             raise KeyboardInterrupt
@@ -762,6 +764,8 @@ def get_env_info_lines() -> list[tuple[str, str]]:
     backend_status = ", ".join(blabels) if blabels else "无"
     backend_color = "green" if blabels else "red"
     lines.append(("凭据后端", backend_status, backend_color))
+    if plat == "linux" and not backends:
+        lines.append(("", "安装 libsecret-tools: apt install libsecret-tools", "red"))
 
     # ── 当前项目 (.claude/) ──
     lines.append(("项目路径", os.getcwd(), ""))
