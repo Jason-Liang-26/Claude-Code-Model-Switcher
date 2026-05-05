@@ -63,4 +63,4 @@ OS 凭据管理器                     ← sk 实际存储（DPAPI/Keychain/secr
 
 - [用户手册](claude-code-model-switcher-help.md)
 - [规格文档](CCMS-SPEC.md)
-- [开发日志](CCMS-DEVLOG.md)
+- [开发日志](devlog/CCMS-DEVLOG.md)
