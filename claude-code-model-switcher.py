@@ -560,9 +560,9 @@ def _linux_file_store(identity: str, keyname: str, sk: str):
     r = subprocess.run(
         ["openssl", "enc", "-aes-256-cbc", "-pbkdf2",
          "-pass", f"file:{identity}"],
-        input=sk, text=True, capture_output=True, timeout=10)
+        input=sk.encode(), capture_output=True, timeout=10)
     if r.returncode != 0:
-        raise RuntimeError(f"openssl 加密失败: {r.stderr.strip()}")
+        raise RuntimeError(f"openssl 加密失败: {r.stderr.decode(errors='replace').strip()}")
     with open(cred_path, "wb") as f:
         f.write(r.stdout)
 
