@@ -24,6 +24,7 @@ def _project_path(subpath: str) -> str:
     return os.path.join(os.getcwd(), ".claude", subpath)
 
 PROJECT_SETTINGS_PATH = _project_path("settings.json")
+LOCAL_SETTINGS_PATH = _project_path("settings.local.json")
 HELPER_SCRIPT_PATH = _project_path("get-sk.sh")
 
 # ============================================================
@@ -635,6 +636,71 @@ def load_user_settings() -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def load_local_settings() -> dict:
+    """读取 .claude/settings.local.json"""
+    if not os.path.isfile(LOCAL_SETTINGS_PATH):
+        return {}
+    try:
+        with open(LOCAL_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_local_settings(settings: dict):
+    """写入 .claude/settings.local.json"""
+    os.makedirs(os.path.dirname(LOCAL_SETTINGS_PATH), exist_ok=True)
+    with open(LOCAL_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+def load_merged_ccms_settings() -> dict:
+    """合并 project + local settings，local 覆盖 project。
+
+    对 env 子 dict 做深度合并，保留两边的非 CCMS 环境变量。
+    旧用户升级后 local 无文件时回退到 project settings。"""
+    project = load_project_settings()
+    local = load_local_settings()
+    merged = dict(project)
+    merged.update(local)
+    project_env = project.get("env")
+    local_env = local.get("env")
+    if project_env is not None or local_env is not None:
+        merged_env = dict(project_env or {})
+        merged_env.update(local_env or {})
+        merged["env"] = merged_env
+    return merged
+
+def _migrate_ccms_fields_from_project():
+    """从 .claude/settings.json 移除 CCMS 托管字段。
+
+    首次写入 local 后调用，一次性清理。静默处理所有错误。"""
+    if not os.path.isfile(PROJECT_SETTINGS_PATH):
+        return
+    try:
+        with open(PROJECT_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return
+    env = settings.get("env", {})
+    changed = False
+    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CCMS_MODEL_ALIAS"):
+        if key in env:
+            del env[key]
+            changed = True
+    if "apiKeyHelper" in settings:
+        del settings["apiKeyHelper"]
+        changed = True
+    if not changed:
+        return
+    if not env and "env" in settings:
+        del settings["env"]
+    if not settings:
+        os.remove(PROJECT_SETTINGS_PATH)
+    else:
+        with open(PROJECT_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(settings, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+
 def resolve_model(target: str, models: dict) -> tuple[str, dict] | None:
     """通过别名或 modelName 查找模型，返回 (alias, config)"""
     if target in models:
@@ -649,7 +715,7 @@ def get_current_alias(models: dict) -> str | None:
     """返回当前项目设置的模型别名。
     优先读 CCMS_MODEL_ALIAS（本工具写入），否则从 ANTHROPIC_MODEL 反查。
     未找到别名的返回 ANTHROPIC_MODEL 原始值（非托管）。"""
-    s = load_project_settings()
+    s = load_merged_ccms_settings()
     env = s.get("env", {})
     current_model = env.get("ANTHROPIC_MODEL", None)
     if not current_model:
@@ -691,9 +757,8 @@ def migrate_models(models: dict) -> dict:
 # ============================================================
 
 def write_model_to_project(alias: str, model_config: dict):
-    """写入项目 .claude/settings.json (env 不含 sk) 并生成 helper 脚本"""
-    settings = load_project_settings()
-    # 合并 env（保留用户其他环境变量）
+    """写入项目 .claude/settings.local.json (env 不含 sk) 并生成 helper 脚本"""
+    settings = load_local_settings()
     if "env" not in settings:
         settings["env"] = {}
     settings["env"]["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
@@ -703,8 +768,9 @@ def write_model_to_project(alias: str, model_config: dict):
         settings["apiKeyHelper"] = "powershell -NoProfile -Command .claude\\get-sk.ps1"
     else:
         settings["apiKeyHelper"] = ".claude/get-sk.sh"
-    save_project_settings(settings)
+    save_local_settings(settings)
     _generate_helper_scripts()
+    _migrate_ccms_fields_from_project()
 
 def _generate_helper_scripts():
     """生成 helper 脚本（.sh + .ps1），委托给 Python 取凭据"""
@@ -729,7 +795,7 @@ def _generate_helper_scripts():
     if (-not $ModelArg) {{
         $ModelArg = & $py -c "
     import json
-    s = json.load(open('$root/.claude/settings.json'))
+    s = json.load(open('$root/.claude/settings.local.json'))
     print(s.get('env', {{}}).get('ANTHROPIC_MODEL', ''))
     " 2>$null
     }}
@@ -773,7 +839,7 @@ def _generate_helper_scripts():
     if [ -z "$MODEL" ]; then
         MODEL=$("$_PY" -c "
     import json
-    s = json.load(open('$SELF_DIR/.claude/settings.json'))
+    s = json.load(open('$SELF_DIR/.claude/settings.local.json'))
     print(s.get('env', {{}}).get('ANTHROPIC_MODEL', ''))
     " 2>/dev/null || echo "")
     fi
@@ -920,16 +986,20 @@ def cmd_migrate_import():
 # ============================================================
 
 def detect_env_api_key_conflict():
-    """检查是否有 settings.json 在 env 中配置了 ANTHROPIC_API_KEY"""
+    """检查三层 settings 中是否有 env 直接配置了 ANTHROPIC_API_KEY"""
     conflicts = []
+    # 本地级（最高优先级）
+    ls = load_local_settings()
+    if ls.get("env", {}).get("ANTHROPIC_API_KEY"):
+        conflicts.append(("本地 (local)", str(LOCAL_SETTINGS_PATH)))
     # 项目级
     ps = load_project_settings()
     if ps.get("env", {}).get("ANTHROPIC_API_KEY"):
-        conflicts.append(("项目", PROJECT_SETTINGS_PATH))
+        conflicts.append(("项目 (project)", str(PROJECT_SETTINGS_PATH)))
     # 用户级
     us = load_user_settings()
     if us.get("env", {}).get("ANTHROPIC_API_KEY"):
-        conflicts.append(("用户", os.path.expanduser("~/.claude/settings.json")))
+        conflicts.append(("用户 (user)", os.path.expanduser("~/.claude/settings.json")))
     return conflicts
 
 
@@ -1031,6 +1101,39 @@ def is_global_config_dir() -> bool:
     except Exception:
         return False
 
+def _ensure_gitignore():
+    """确保 .gitignore 包含 .claude/settings.local.json。
+
+    检测当前目录是否为 git 仓库，如果是则检查 .gitignore
+    是否已忽略 settings.local.json，若否自动追加。"""
+    try:
+        # 检查是否为 git 仓库
+        r = subprocess.run(["git", "rev-parse", "--git-dir"],
+                           capture_output=True, timeout=3)
+        if r.returncode != 0:
+            return
+    except Exception:
+        return
+    gitignore_path = os.path.join(os.getcwd(), ".gitignore")
+    patterns = (".claude/settings.local.json\n", ".claude/\n", ".claude\n")
+    if os.path.isfile(gitignore_path):
+        with open(gitignore_path, "r", encoding="utf-8") as f:
+            content = f.read()
+        for pat in patterns:
+            pattern_line = pat.rstrip("\n")
+            if pattern_line in content:
+                return  # 已有忽略规则
+    else:
+        content = ""
+    # 追加忽略规则
+    line = ".claude/settings.local.json\n"
+    if content and not content.endswith("\n"):
+        content += "\n"
+    content += line
+    with open(gitignore_path, "w", encoding="utf-8") as f:
+        f.write(content)
+    _print_color(f"✔ 已将 {line.strip()} 追加到 .gitignore\n", color="\033[32m")
+
 # ============================================================
 # 环境信息显示
 # ============================================================
@@ -1063,7 +1166,7 @@ def get_env_info_lines() -> list[tuple[str, str]]:
 
     # ── 当前项目 (.claude/) ──
     lines.append(("项目路径", os.getcwd(), ""))
-    lines.append(("配置文件", ".claude/settings.json", ""))
+    lines.append(("配置文件", "settings.local.json (local) + settings.json (project)", ""))
 
     # apiKeyHelper 状态
     helper_dir = os.path.dirname(HELPER_SCRIPT_PATH)
@@ -1083,6 +1186,16 @@ def get_env_info_lines() -> list[tuple[str, str]]:
         for scope, path in conflicts:
             lines.append(("⚠ 冲突", f"{scope}级 {path}", "red"))
             lines.append(("", "env 中配置了 ANTHROPIC_API_KEY，将覆盖 apiKeyHelper", "red"))
+
+    # ── 项目 settings.json 与 local 冲突检测 ──
+    ps = load_project_settings()
+    p_env = ps.get("env", {})
+    for key, label in [("ANTHROPIC_MODEL", "ANTHROPIC_MODEL"),
+                        ("ANTHROPIC_BASE_URL", "ANTHROPIC_BASE_URL")]:
+        if key in p_env:
+            lines.append(("⚠ 冲突",
+                          f"settings.json 中配置了 {label}: \"{p_env[key]}\"，settings.local.json 的值会覆盖它",
+                          "yellow"))
 
     # ── 全局 (~/.claude/) ──
     models = load_custom_models()
@@ -1106,6 +1219,9 @@ def main():
 
     current = get_current_alias(models)
 
+    # 启动时检查 gitignore 配置
+    _ensure_gitignore()
+
     while True:
         print("\033[2J\033[H", end="")
         width = shutil.get_terminal_size().columns
@@ -1116,7 +1232,7 @@ def main():
         _print_color("  📁 当前目录: ", dim=True)
         _print_color(f"{cwd}\n", dim=True)
         if is_global_config_dir():
-            _print_color("  ⚠  当前处于全局配置目录，切换模型会影响全局配置\n", color="\033[31m", bold=True)
+            _print_color("  ✘  当前处于全局配置目录，切换模型在此被禁止\n", color="\033[31m", bold=True)
         print()
 
         # 渲染环境信息，按分区展示
@@ -1125,7 +1241,7 @@ def main():
         sections = {
             "系统": "系统信息 (System)",
             "凭据后端": None,
-            "项目路径": "当前项目 (.claude/settings.json)",
+            "项目路径": "当前项目 (.claude/settings.local.json + settings.json)",
             "配置文件": None,
             "apiKeyHelper": None,
             "⚠ 冲突": None,
@@ -1151,18 +1267,18 @@ def main():
             _print_color(f"{value}\n", color=col)
 
         print()
-        # 检测托管状态
-        ps = load_project_settings()
-        managed_alias = ps.get("env", {}).get("CCMS_MODEL_ALIAS", None)
+        # 检测托管状态（从 merged settings 读取，local 覆盖 project）
+        merged = load_merged_ccms_settings()
+        managed_alias = merged.get("env", {}).get("CCMS_MODEL_ALIAS", None)
         if managed_alias:
             _print_color(f"  ★ 模型: ", dim=True)
             _print_color(f"{managed_alias}", bold=True)
-            mn = ps.get("env", {}).get("ANTHROPIC_MODEL", "")
+            mn = merged.get("env", {}).get("ANTHROPIC_MODEL", "")
             if mn and mn != managed_alias:
                 _print_color(f" → {mn}", dim=True)
             _print_color("\n", dim=True)
         elif current:
-            an_model = ps.get("env", {}).get("ANTHROPIC_MODEL", "?")
+            an_model = merged.get("env", {}).get("ANTHROPIC_MODEL", "?")
             _print_color(f"  ⚠ 未托管 model-switcher", color="\033[33m")
             _print_color(f"，当前 ANTHROPIC_MODEL: {an_model}\n", dim=True)
         else:
@@ -1202,10 +1318,11 @@ def main():
                 else:
                     continue
             if is_global_config_dir():
-                _print_color(f"\n⚠  当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
-                _print_color(f"   切换模型 \"{alias}\" 会修改全局 ~/.claude/settings.json，影响所有未配置的项目\n", color="\033[33m")
-                if not confirm("确定要继续吗？", default_no=True):
-                    continue
+                _print_color(f"\n✘ 当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
+                _print_color(f"   切换模型会修改 ~/.claude/settings.local.json，影响所有未配置的项目\n", color="\033[33m")
+                _print_color(f"   请在项目目录下运行本工具。\n", color="\033[33m")
+                _press_enter()
+                continue
             write_model_to_project(alias, cfg)
             current = alias
             mn = cfg.get("modelName", alias)
@@ -1277,9 +1394,11 @@ def main():
             if confirm("立即切换到该模型吗？"):
                 proceed = True
                 if is_global_config_dir():
-                    _print_color(f"\n⚠  当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
-                    _print_color(f"   切换会修改全局 ~/.claude/settings.json\n", color="\033[33m")
-                    proceed = confirm("确定要继续吗？", default_no=True)
+                    _print_color(f"\n✘ 当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
+                    _print_color(f"   切换会修改 ~/.claude/settings.local.json，影响所有未配置的项目\n", color="\033[33m")
+                    _print_color(f"   请在项目目录下运行本工具。\n", color="\033[33m")
+                    _press_enter()
+                    proceed = False
                 if proceed:
                     write_model_to_project(alias, models[alias])
                     current = alias

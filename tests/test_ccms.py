@@ -201,7 +201,9 @@ class TestCredDefaultConfig(unittest.TestCase):
 
     @mock.patch("ccms.platform.system")
     @mock.patch("ccms._is_gui_session", return_value=True)
-    def test_linux_gui_secret_service(self, mock_gui, mock_system):
+    @mock.patch("ccms.subprocess.run")
+    def test_linux_gui_secret_service(self, mock_run, mock_gui, mock_system):
+        mock_run.return_value = mock.Mock(returncode=0)
         mock_system.return_value = "Linux"
         cfg = ccms.cred_default_config("my-model")
         self.assertEqual(cfg["type"], "secret-service")
@@ -378,32 +380,249 @@ class TestMigrateModels(unittest.TestCase):
         mock_cred_store.assert_not_called()
 
 
+class TestLoadSaveLocalSettings(unittest.TestCase):
+    """load_local_settings / save_local_settings — local JSON I/O."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.settings_path = Path(self.tmpdir.name) / ".claude" / "settings.local.json"
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.patch_local = mock.patch(
+            "ccms.LOCAL_SETTINGS_PATH", str(self.settings_path)
+        )
+        self.patch_local.start()
+
+    def tearDown(self):
+        self.patch_local.stop()
+        self.tmpdir.cleanup()
+
+    def test_load_missing_file(self):
+        self.assertFalse(self.settings_path.exists())
+        self.assertEqual(ccms.load_local_settings(), {})
+
+    def test_roundtrip(self):
+        data = {"env": {"ANTHROPIC_MODEL": "test-model"}, "apiKeyHelper": "echo ok"}
+        ccms.save_local_settings(data)
+        loaded = ccms.load_local_settings()
+        self.assertEqual(loaded, data)
+
+    def test_creates_directories(self):
+        deep_path = Path(self.tmpdir.name) / "a" / "b" / ".claude" / "settings.local.json"
+        with mock.patch("ccms.LOCAL_SETTINGS_PATH", str(deep_path)):
+            ccms.save_local_settings({"x": 1})
+        self.assertTrue(deep_path.exists())
+
+
+class TestLoadMergedSettings(unittest.TestCase):
+    """load_merged_ccms_settings — local over project layering."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.project_path = Path(self.tmpdir.name) / ".claude" / "settings.json"
+        self.local_path = Path(self.tmpdir.name) / ".claude" / "settings.local.json"
+        for p in [self.project_path, self.local_path]:
+            p.parent.mkdir(parents=True, exist_ok=True)
+        self.patch_project = mock.patch(
+            "ccms.PROJECT_SETTINGS_PATH", str(self.project_path)
+        )
+        self.patch_local = mock.patch(
+            "ccms.LOCAL_SETTINGS_PATH", str(self.local_path)
+        )
+        self.patch_project.start()
+        self.patch_local.start()
+
+    def tearDown(self):
+        self.patch_project.stop()
+        self.patch_local.stop()
+        self.tmpdir.cleanup()
+
+    def test_neither_exists(self):
+        self.assertEqual(ccms.load_merged_ccms_settings(), {})
+
+    def test_only_project_has_settings(self):
+        self.project_path.write_text(
+            '{"env": {"ANTHROPIC_MODEL": "claude-3"}, "apiKeyHelper": "echo"}'
+        )
+        merged = ccms.load_merged_ccms_settings()
+        self.assertEqual(merged["env"]["ANTHROPIC_MODEL"], "claude-3")
+        self.assertEqual(merged["apiKeyHelper"], "echo")
+
+    def test_only_local_has_settings(self):
+        self.local_path.write_text(
+            '{"env": {"ANTHROPIC_MODEL": "claude-4"}, "apiKeyHelper": "ps1"}'
+        )
+        merged = ccms.load_merged_ccms_settings()
+        self.assertEqual(merged["env"]["ANTHROPIC_MODEL"], "claude-4")
+        self.assertEqual(merged["apiKeyHelper"], "ps1")
+
+    def test_local_overrides_project(self):
+        self.project_path.write_text(
+            '{"env": {"ANTHROPIC_MODEL": "claude-3", "ANTHROPIC_BASE_URL": "url1"}}'
+        )
+        self.local_path.write_text(
+            '{"env": {"ANTHROPIC_MODEL": "claude-4"}}'
+        )
+        merged = ccms.load_merged_ccms_settings()
+        self.assertEqual(merged["env"]["ANTHROPIC_MODEL"], "claude-4")
+        self.assertEqual(merged["env"]["ANTHROPIC_BASE_URL"], "url1")
+
+    def test_local_merges_env_additively(self):
+        self.project_path.write_text('{"env": {"VAR_A": "a"}}')
+        self.local_path.write_text('{"env": {"VAR_B": "b"}}')
+        merged = ccms.load_merged_ccms_settings()
+        self.assertEqual(merged["env"].get("VAR_A"), "a")
+        self.assertEqual(merged["env"].get("VAR_B"), "b")
+
+
+class TestMigrateProjectSettings(unittest.TestCase):
+    """_migrate_ccms_fields_from_project — cleanup old settings.json."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.project_path = Path(self.tmpdir.name) / ".claude" / "settings.json"
+        self.project_path.parent.mkdir(parents=True, exist_ok=True)
+        self.patch_project = mock.patch(
+            "ccms.PROJECT_SETTINGS_PATH", str(self.project_path)
+        )
+        self.patch_project.start()
+
+    def tearDown(self):
+        self.patch_project.stop()
+        self.tmpdir.cleanup()
+
+    def test_removes_ccms_fields(self):
+        self.project_path.write_text(json.dumps({
+            "env": {
+                "ANTHROPIC_BASE_URL": "https://api.example.com",
+                "ANTHROPIC_MODEL": "claude-3",
+                "CCMS_MODEL_ALIAS": "my-model",
+                "USER_VAR": "keep-me"
+            },
+            "apiKeyHelper": "echo old",
+            "other_key": "keep-me-too"
+        }))
+        ccms._migrate_ccms_fields_from_project()
+        remaining = json.loads(self.project_path.read_text())
+        self.assertNotIn("ANTHROPIC_BASE_URL", remaining.get("env", {}))
+        self.assertNotIn("ANTHROPIC_MODEL", remaining.get("env", {}))
+        self.assertNotIn("CCMS_MODEL_ALIAS", remaining.get("env", {}))
+        self.assertNotIn("apiKeyHelper", remaining)
+        self.assertEqual(remaining.get("env", {}).get("USER_VAR"), "keep-me")
+        self.assertEqual(remaining.get("other_key"), "keep-me-too")
+
+    def test_removes_empty_file(self):
+        self.project_path.write_text(json.dumps({
+            "env": {"CCMS_MODEL_ALIAS": "m"},
+            "apiKeyHelper": "echo"
+        }))
+        ccms._migrate_ccms_fields_from_project()
+        self.assertFalse(self.project_path.exists())
+
+    def test_noop_when_no_ccms_fields(self):
+        self.project_path.write_text(json.dumps({"other_key": "value"}))
+        ccms._migrate_ccms_fields_from_project()
+        self.assertEqual(
+            json.loads(self.project_path.read_text()),
+            {"other_key": "value"}
+        )
+
+    def test_noop_when_file_missing(self):
+        ccms._migrate_ccms_fields_from_project()
+
+
+class TestHelperScriptReference(unittest.TestCase):
+    """Generated helper scripts reference settings.local.json."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.helper_path = Path(self.tmpdir.name) / ".claude" / "get-sk.sh"
+        self.helper_path.parent.mkdir(parents=True, exist_ok=True)
+        self.patch_helper = mock.patch(
+            "ccms.HELPER_SCRIPT_PATH", str(self.helper_path)
+        )
+        self.patch_helper.start()
+        self.patch_project = mock.patch(
+            "ccms.PROJECT_SETTINGS_PATH",
+            str(Path(self.tmpdir.name) / ".claude" / "settings.json")
+        )
+        self.patch_project.start()
+        self.patch_local = mock.patch(
+            "ccms.LOCAL_SETTINGS_PATH",
+            str(Path(self.tmpdir.name) / ".claude" / "settings.local.json")
+        )
+        self.patch_local.start()
+
+    def tearDown(self):
+        self.patch_helper.stop()
+        self.patch_project.stop()
+        self.patch_local.stop()
+
+    def test_ps1_references_settings_local_json(self):
+        ccms._generate_helper_scripts()
+        ps1_path = self.helper_path.parent / "get-sk.ps1"
+        content = ps1_path.read_text(encoding="utf-8")
+        self.assertIn("settings.local.json", content)
+
+    def test_sh_references_settings_local_json(self):
+        ccms._generate_helper_scripts()
+        sh_path = self.helper_path.parent / "get-sk.sh"
+        content = sh_path.read_text(encoding="utf-8")
+        self.assertIn("settings.local.json", content)
+
+
 class TestDetectEnvApiKeyConflict(unittest.TestCase):
     """detect_env_api_key_conflict — finds ANTHROPIC_API_KEY in settings."""
 
     def test_no_conflict(self):
         with mock.patch("ccms.load_project_settings", return_value={}), \
-             mock.patch("ccms.load_user_settings", return_value={}):
+             mock.patch("ccms.load_user_settings", return_value={}), \
+             mock.patch("ccms.load_local_settings", return_value={}):
             self.assertEqual(ccms.detect_env_api_key_conflict(), [])
+
+    def test_local_level_conflict(self):
+        with mock.patch("ccms.load_project_settings", return_value={}), \
+             mock.patch("ccms.load_user_settings", return_value={}), \
+             mock.patch(
+                 "ccms.load_local_settings",
+                 return_value={"env": {"ANTHROPIC_API_KEY": "sk-local"}}
+             ):
+            conflicts = ccms.detect_env_api_key_conflict()
+            self.assertEqual(len(conflicts), 1)
+            self.assertIn("local", conflicts[0][0].lower())
 
     def test_project_level_conflict(self):
         with mock.patch(
             "ccms.load_project_settings",
             return_value={"env": {"ANTHROPIC_API_KEY": "sk-xxx"}}
-        ), mock.patch("ccms.load_user_settings", return_value={}):
+        ), mock.patch("ccms.load_user_settings", return_value={}), \
+             mock.patch("ccms.load_local_settings", return_value={}):
             conflicts = ccms.detect_env_api_key_conflict()
             self.assertEqual(len(conflicts), 1)
-            self.assertEqual(conflicts[0][0], "项目")
+            self.assertIn("项目", conflicts[0][0])
 
     def test_user_level_conflict(self):
         with mock.patch("ccms.load_project_settings", return_value={}), \
              mock.patch(
                  "ccms.load_user_settings",
                  return_value={"env": {"ANTHROPIC_API_KEY": "sk-yyy"}}
-             ):
+             ), mock.patch("ccms.load_local_settings", return_value={}):
             conflicts = ccms.detect_env_api_key_conflict()
             self.assertEqual(len(conflicts), 1)
-            self.assertEqual(conflicts[0][0], "用户")
+            self.assertIn("用户", conflicts[0][0])
+
+    def test_all_levels_conflict(self):
+        with mock.patch(
+            "ccms.load_project_settings",
+            return_value={"env": {"ANTHROPIC_API_KEY": "sk-proj"}}
+        ), mock.patch(
+            "ccms.load_user_settings",
+            return_value={"env": {"ANTHROPIC_API_KEY": "sk-user"}}
+        ), mock.patch(
+            "ccms.load_local_settings",
+            return_value={"env": {"ANTHROPIC_API_KEY": "sk-local"}}
+        ):
+            conflicts = ccms.detect_env_api_key_conflict()
+            self.assertEqual(len(conflicts), 3)
 
 
 if __name__ == "__main__":

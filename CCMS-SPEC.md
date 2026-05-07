@@ -25,14 +25,14 @@ CCMS 是 Claude Code 自定义模型管理工具，功能：
 │  ┌──────┴─────────────────┴───────────────┴──────┐ │
 │  │              数据层                             │ │
 │  │  ~/.claude/custom-models.json  (全局，不含sk)    │ │
-│  │  ./.claude/settings.json       (项目，CWD)      │ │
+│  │  .claude/settings.local.json   (项目本地，CWD)  │ │
 │  │  ./.claude/get-sk.ps1 / .sh    (helper，生成)   │ │
 │  │  OS 凭据管理器                  (sk 存储)       │ │
 │  └───────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────┘
 
 Claude Code 启动
-  → settings.json: apiKeyHelper → 命令
+  → settings.local.json / settings.json: apiKeyHelper → 命令
   → get-sk.ps1 / get-sk.sh
     → python claude-code-model-switcher.py --get-sk <model>
     → cred_retrieve() → OS 凭据管理器 → sk → stdout
@@ -64,7 +64,9 @@ Claude Code 启动
 | credential.type | 凭据后端类型 | — |
 | credential.* | 后端参数 | — |
 
-### .claude/settings.json（项目级、CWD）
+### .claude/settings.local.json（项目本地、CWD、gitignored）
+
+CCMS 写入此文件（local 层），因为是开发者个人偏好而非项目配置。读取时合并 local + project 两层，local 覆盖 project。
 
 ```json
 {
@@ -77,7 +79,7 @@ Claude Code 启动
 }
 ```
 
-`CCMS_MODEL_ALIAS` 是托管标记——有此字段说明由本工具管理。缺失时交互界面显示"未托管"警告。env 合并写入，不覆盖用户手动添加的其他变量。
+`CCMS_MODEL_ALIAS` 是托管标记——有此字段说明由本工具管理。缺失时交互界面显示"未托管"警告。读取时通过 `load_merged_ccms_settings()` 合并 local + project 两层，env 深度合并保留两边非 CCMS 变量。
 
 ## 凭据后端
 

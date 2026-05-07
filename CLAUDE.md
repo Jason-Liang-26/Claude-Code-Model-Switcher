@@ -33,17 +33,18 @@ python claude-code-model-switcher.py --reveal
 
 All project-level paths are resolved against `os.getcwd()` at module load time:
 
-- `./.claude/settings.json` — project config (env vars + `apiKeyHelper`)
+- `.claude/settings.local.json` — local config (env vars + `apiKeyHelper`, gitignored, CCMS writes here)
 - `./.claude/get-sk.sh` / `get-sk.ps1` — generated helper scripts
 
-**Critical implication**: running the script from `~` writes to `~/.claude/settings.json` (the user-level config), silently affecting all unconfigured projects. A guard (`is_global_config_dir()`) detects this and shows warnings + requires confirmation.
+**Critical implication**: running the script from `~` writes to `~/.claude/settings.local.json` (the user-level config), silently affecting all unconfigured projects. A guard (`is_global_config_dir()`) detects this and shows warnings + requires confirmation.
 
 ### Three-Layer Data Model
 
 | Layer | Storage | Content |
 |-------|---------|---------|
 | Global models | `~/.claude/custom-models.json` | Alias, URL, modelName, credential reference (no sk) |
-| Project config | `./.claude/settings.json` | `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_MODEL`, `apiKeyHelper` |
+| Local config | `.claude/settings.local.json` | CCMS-managed: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_MODEL`, `apiKeyHelper` (local layer, gitignored) |
+| Project config | `.claude/settings.json` | Non-CCMS fields preserved; CCMS reads merged local + project |
 | Credentials | OS credential manager / `~/.local/share/ccms/` | Actual sk (DPAPI / Keychain / age / openssl / secret-service) |
 
 ### Credential Backend Abstraction
@@ -67,7 +68,7 @@ When switching models, `_generate_helper_scripts()` creates:
 - `.claude/get-sk.ps1` — Windows PowerShell, calls `python ... --get-sk`
 - `.claude/get-sk.sh` — WSL/Bash, with WSL path conversion (`C:\...` → `/mnt/c/...`)
 
-Both embed absolute paths at generation time (no runtime path resolution). The helper reads `settings.json` to get the current model, then calls `--get-sk` to retrieve the sk from the OS credential manager.
+Both embed absolute paths at generation time (no runtime path resolution). The helper reads `settings.local.json` to get the current model, then calls `--get-sk` to retrieve the sk from the OS credential manager.
 
 **WSL nuance**: WSL Python cannot access Windows DPAPI. The script ensures the Windows Python executable (`python.exe`) is used in WSL, which has the Windows user token and can call `advapi32`.
 
