@@ -1,0 +1,23 @@
+claude-code-model-switcher.py
+  10779e2b27630981 1108-1126,1132-1148,1282,1337-1342,1355,1373-1378,1383-1393,1461-1467,1472-1482
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.15",
+  "base_commit_sha": "3eadebee139f2149fb76771f453682f50f4ba3c0",
+  "prompts": {
+    "10779e2b27630981": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "49db27b8-7131-473f-b797-f06772c11ba5",
+        "model": "deepseek-v4-flash"
+      },
+      "human_author": "liangjc1",
+      "messages": [],
+      "total_additions": 1596,
+      "total_deletions": 1519,
+      "accepted_lines": 1390,
+      "overriden_lines": 148
+    }
+  }
+}
