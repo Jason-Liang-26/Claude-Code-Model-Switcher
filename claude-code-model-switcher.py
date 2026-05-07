@@ -1101,6 +1101,53 @@ def is_global_config_dir() -> bool:
     except Exception:
         return False
 
+
+def _backup_user_settings_json_once():
+    """备份 ~/.claude/settings.json（仅当存在且非空）。
+
+    仅在全局配置目录下调用。仅备份一次（检测 .bak 文件存在）。
+    确保用户的现有配置不会因 CCMS 写入而丢失。"""
+    path = os.path.expanduser("~/.claude/settings.json")
+    if not os.path.isfile(path):
+        return False
+    bak = path + ".bak"
+    if os.path.isfile(bak):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read()
+        if not content.strip():
+            return False
+        with open(bak, "w", encoding="utf-8") as f:
+            f.write(content)
+        _print_color(f"✔ 已备份现有配置: {bak}\n", color="\033[32m")
+        return True
+    except OSError:
+        return False
+
+
+def _check_high_priority_env_vars() -> list[tuple[str, str]]:
+    """检查各层 settings 中是否有 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN。
+
+    这些环境变量的优先级高于 apiKeyHelper，会导致 helper 脚本不生效。
+    返回 [(文件名, 变量名), ...] 列表。"""
+    warnings = []
+    for load_fn, label in [
+        (load_local_settings, "settings.local.json"),
+        (load_project_settings, "settings.json"),
+        (load_user_settings, "~/.claude/settings.json"),
+    ]:
+        try:
+            s = load_fn()
+            env = s.get("env", {})
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+                if key in env:
+                    warnings.append((label, key))
+        except Exception:
+            pass
+    return warnings
+
+
 def _ensure_gitignore():
     """确保 .gitignore 包含 .claude/settings.local.json。
 
@@ -1232,7 +1279,7 @@ def main():
         _print_color("  📁 当前目录: ", dim=True)
         _print_color(f"{cwd}\n", dim=True)
         if is_global_config_dir():
-            _print_color("  ✘  当前处于全局配置目录，切换模型在此被禁止\n", color="\033[31m", bold=True)
+            _print_color("  ⚠  当前处于用户目录，将编辑全局默认配置\n", color="\033[33m", bold=True)
         print()
 
         # 渲染环境信息，按分区展示
@@ -1287,7 +1334,12 @@ def main():
 
         names = list(models.keys())
         menu_items = []
-        if names: menu_items.append("切换模型")
+        _in_global = is_global_config_dir()
+        if names:
+            if _in_global:
+                menu_items.append("切换全局默认模型")
+            else:
+                menu_items.append("切换模型")
         menu_items.append("添加模型")
         if names: menu_items.append("删除模型")
         menu_items.append("查看凭据状态")
@@ -1300,7 +1352,7 @@ def main():
         choice = menu_items[idx]
 
         # ---- 切换 ----
-        if choice == "切换模型":
+        if choice in ("切换模型", "切换全局默认模型"):
             sel = select_from_list(names, title="选择要切换的模型")
             if sel is None: continue
             alias = names[sel]
@@ -1318,15 +1370,27 @@ def main():
                 else:
                     continue
             if is_global_config_dir():
-                _print_color(f"\n✘ 当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
-                _print_color(f"   切换模型会修改 ~/.claude/settings.local.json，影响所有未配置的项目\n", color="\033[33m")
-                _print_color(f"   请在项目目录下运行本工具。\n", color="\033[33m")
-                _press_enter()
-                continue
+                _print_color(f"\n⚠ 当前处于用户目录 (~)\n", color="\033[33m", bold=True)
+                _print_color(f"   即将编辑全局默认配置: ~/.claude/settings.local.json\n", color="\033[33m")
+                _print_color(f"   这将影响所有未单独配置 Claude Code 的项目！\n", color="\033[33m")
+                if not confirm("确定要修改全局配置吗？", default_no=True):
+                    continue
+                _backup_user_settings_json_once()
             write_model_to_project(alias, cfg)
             current = alias
             mn = cfg.get("modelName", alias)
             _print_color(f"✔ 已切换至: {alias} (modelName: {mn})\n", color="\033[32m")
+            # 切换后检查高优先级环境变量
+            high_prio = _check_high_priority_env_vars()
+            if high_prio:
+                _print_color(f"\n⚠ 以下文件配置了高优先级的认证变量，", color="\033[33m")
+                _print_color(f"优先级高于 apiKeyHelper：\n", color="\033[33m")
+                for label, key in high_prio:
+                    _print_color(f"  · {label} → {key}\n", color="\033[33m")
+                _print_color(
+                    f"  这些变量会覆盖 apiKeyHelper 返回的凭据，"
+                    f"如果模型 API 认证失败，请检查并移除这些配置。\n",
+                    color="\033[33m")
             print_env_export(alias, cfg)
             _press_enter()
             continue
@@ -1394,15 +1458,28 @@ def main():
             if confirm("立即切换到该模型吗？"):
                 proceed = True
                 if is_global_config_dir():
-                    _print_color(f"\n✘ 当前处于全局配置目录 (~)\n", color="\033[31m", bold=True)
-                    _print_color(f"   切换会修改 ~/.claude/settings.local.json，影响所有未配置的项目\n", color="\033[33m")
-                    _print_color(f"   请在项目目录下运行本工具。\n", color="\033[33m")
-                    _press_enter()
-                    proceed = False
+                    _print_color(f"\n⚠ 当前处于用户目录 (~)\n", color="\033[33m", bold=True)
+                    _print_color(f"   即将编辑全局默认配置: ~/.claude/settings.local.json\n", color="\033[33m")
+                    _print_color(f"   这将影响所有未单独配置 Claude Code 的项目！\n", color="\033[33m")
+                    if not confirm("确定要修改全局配置吗？", default_no=True):
+                        proceed = False
+                    else:
+                        _backup_user_settings_json_once()
                 if proceed:
                     write_model_to_project(alias, models[alias])
                     current = alias
                     _print_color(f"✔ 已切换至: {alias} (modelName: {mn})\n", color="\033[32m")
+                    # 切换后检查高优先级环境变量
+                    high_prio = _check_high_priority_env_vars()
+                    if high_prio:
+                        _print_color(f"\n⚠ 以下文件配置了高优先级的认证变量，", color="\033[33m")
+                        _print_color(f"优先级高于 apiKeyHelper：\n", color="\033[33m")
+                        for label, key in high_prio:
+                            _print_color(f"  · {label} → {key}\n", color="\033[33m")
+                        _print_color(
+                            f"  这些变量会覆盖 apiKeyHelper 返回的凭据，"
+                            f"如果模型 API 认证失败，请检查并移除这些配置。\n",
+                            color="\033[33m")
                     print_env_export(alias, models[alias])
 
             _press_enter()
