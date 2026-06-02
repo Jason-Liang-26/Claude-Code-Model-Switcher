@@ -1,0 +1,27 @@
+tests/test_ccms.py
+  b56f24d648c31d88 499,510
+CLAUDE.md
+  b56f24d648c31d88 13,16-17
+claude-code-model-switcher.py
+  b56f24d648c31d88 686,767
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.22",
+  "base_commit_sha": "917c2854a124b206ea10ff35e4cbb70157bcb804",
+  "prompts": {
+    "b56f24d648c31d88": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "b1e356d1-d494-4504-9231-76ca1e81cd47",
+        "model": "mimo-v2.5-pro"
+      },
+      "human_author": "liangjc1",
+      "messages": [],
+      "total_additions": 2309,
+      "total_deletions": 2297,
+      "accepted_lines": 1401,
+      "overriden_lines": 150
+    }
+  }
+}
