@@ -683,7 +683,7 @@ def _migrate_ccms_fields_from_project():
         return
     env = settings.get("env", {})
     changed = False
-    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CCMS_MODEL_ALIAS"):
+    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CCMS_MODEL_ALIAS", "CLAUDE_CODE_SUBAGENT_MODEL"):
         if key in env:
             del env[key]
             changed = True
@@ -764,6 +764,7 @@ def write_model_to_project(alias: str, model_config: dict):
     settings["env"]["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
     settings["env"]["ANTHROPIC_MODEL"] = model_config.get("modelName", alias)
     settings["env"]["CCMS_MODEL_ALIAS"] = alias  # 本工具管理标记
+    settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = model_config.get("modelName", alias)
     if _detect_platform() == "windows":
         settings["apiKeyHelper"] = "powershell -NoProfile -Command .claude\\get-sk.ps1"
     else:

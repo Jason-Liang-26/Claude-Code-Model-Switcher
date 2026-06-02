@@ -10,9 +10,18 @@ CCMS is a single-file Python script (`claude-code-model-switcher.py`, ~1000 line
 
 ## Running / Testing
 
-There is no build system, test framework, or linter. Verification is manual:
+There is no build system or linter. Tests use stdlib `unittest` only:
 
 ```bash
+# Run all tests
+python -m unittest discover tests
+
+# Run a single test file
+python -m unittest tests.test_ccms
+
+# Run a single test class
+python -m unittest tests.test_ccms.TestResolveModel
+
 # Interactive menu (primary verification)
 python claude-code-model-switcher.py
 

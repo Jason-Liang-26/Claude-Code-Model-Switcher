@@ -496,6 +496,7 @@ class TestMigrateProjectSettings(unittest.TestCase):
                 "ANTHROPIC_BASE_URL": "https://api.example.com",
                 "ANTHROPIC_MODEL": "claude-3",
                 "CCMS_MODEL_ALIAS": "my-model",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "sub-model",
                 "USER_VAR": "keep-me"
             },
             "apiKeyHelper": "echo old",
@@ -506,6 +507,7 @@ class TestMigrateProjectSettings(unittest.TestCase):
         self.assertNotIn("ANTHROPIC_BASE_URL", remaining.get("env", {}))
         self.assertNotIn("ANTHROPIC_MODEL", remaining.get("env", {}))
         self.assertNotIn("CCMS_MODEL_ALIAS", remaining.get("env", {}))
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", remaining.get("env", {}))
         self.assertNotIn("apiKeyHelper", remaining)
         self.assertEqual(remaining.get("env", {}).get("USER_VAR"), "keep-me")
         self.assertEqual(remaining.get("other_key"), "keep-me-too")
