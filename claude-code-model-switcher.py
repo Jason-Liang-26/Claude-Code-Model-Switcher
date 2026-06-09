@@ -18,7 +18,9 @@ import platform
 import textwrap
 
 
-CUSTOM_MODELS_PATH = os.path.expanduser("~/.claude/custom-models.json")
+# v2 数据存储（endpoint → model → routing 三层模型）
+MODELS_PATH = os.path.expanduser("~/.claude/ccms-endpoints.json")
+LEGACY_MODELS_PATH = os.path.expanduser("~/.claude/custom-models.json")
 # 项目级路径基于当前工作目录（CWD），确保从任意位置运行都找到当前项目的 .claude/
 def _project_path(subpath: str) -> str:
     return os.path.join(os.getcwd(), ".claude", subpath)
@@ -597,23 +599,107 @@ def _json_strip_trailing_commas(text: str) -> str:
     return text
 
 def load_custom_models() -> dict:
-    if not os.path.isfile(CUSTOM_MODELS_PATH):
-        return {}
-    with open(CUSTOM_MODELS_PATH, "r", encoding="utf-8") as f:
-        raw = f.read()
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        fixed = _json_strip_trailing_commas(raw)
+    """加载 v2 模型数据。首次运行时从旧版 custom-models.json 导入。"""
+    if os.path.isfile(MODELS_PATH):
+        with open(MODELS_PATH, "r", encoding="utf-8") as f:
+            raw = f.read()
         try:
-            return json.loads(fixed)
+            data = json.loads(raw)
         except json.JSONDecodeError:
-            _print_color(f"错误: {CUSTOM_MODELS_PATH} 格式错误，无法解析\n", color="\033[31m")
-            sys.exit(1)
+            data = json.loads(_json_strip_trailing_commas(raw))
+        # 旧版 v2 格式迁移（顶层 models → endpoint 内）
+        if "models" in data:
+            data = _migrate_old_v2(data)
+            save_custom_models(data)
+        return data
+    # 首次运行：从旧版 custom-models.json 导入（或直接使用已迁移的 v2 数据）
+    data = {"endpoints": {}, "routing": {}}
+    if os.path.isfile(LEGACY_MODELS_PATH):
+        with open(LEGACY_MODELS_PATH, "r", encoding="utf-8") as f:
+            raw = f.read()
+        try:
+            legacy = json.loads(raw)
+        except json.JSONDecodeError:
+            legacy = json.loads(_json_strip_trailing_commas(raw))
+        if legacy:
+            if isinstance(legacy, dict) and "endpoints" in legacy and "routing" in legacy \
+                    and "models" not in legacy:
+                data = legacy  # 已是新版 v2 格式（model 在 endpoint 内）
+            elif isinstance(legacy, dict) and "endpoints" in legacy and "models" in legacy:
+                # 旧版 v2 格式：model 在顶层，需迁移到 endpoint 内
+                data = _migrate_old_v2(legacy)
+            else:
+                data = _import_legacy(legacy)  # v1 格式
+            save_custom_models(data)
+    return data
+
+
+def _migrate_old_v2(data: dict) -> dict:
+    """旧 v2 格式 → 新 v2 格式：顶层 models 迁移到 endpoint 内。
+
+    旧: {endpoints: {ep: {url, credential}}, models: {alias: {endpoint, modelName}}, routing}
+    新: {endpoints: {ep: {url, credential, models: {alias: {modelName}}}}, routing}
+    """
+    for alias, m in data.get("models", {}).items():
+        ep_name = m.get("endpoint", "")
+        if ep_name in data.get("endpoints", {}):
+            data["endpoints"][ep_name].setdefault("models", {})[alias] = {
+                "modelName": m.get("modelName", alias)
+            }
+    data.pop("models", None)
+    data.pop("_version", None)
+    return data
+
+
+def _import_legacy(legacy: dict) -> dict:
+    """从 v1 扁平格式 {alias: {url, modelName, credential/sk}} 导入为 v2。"""
+    endpoints = {}
+    url_to_ep = {}
+    ep_counter = 0
+    all_aliases = []
+
+    for alias, cfg in sorted(legacy.items()):
+        if not isinstance(cfg, dict):
+            continue
+        url = cfg.get("url", "")
+        cred = cfg.get("credential", {})
+        mn = cfg.get("modelName", alias)
+
+        if "sk" in cfg and not cred:
+            sk = cfg.pop("sk")
+            if sk:
+                cred = cred_default_config(alias)
+                cred_store(cred, sk)
+
+        cred_key = cred.get("keyname") or cred.get("target") or cred.get("account", "")
+        ep_key = (url, cred_key)
+        if ep_key not in url_to_ep:
+            ep_counter += 1
+            ep_name = _infer_endpoint_name(url)
+            if ep_name in endpoints:
+                ep_name = f"{ep_name}-{ep_counter}"
+            url_to_ep[ep_key] = ep_name
+            endpoints[ep_name] = {"url": url, "credential": cred, "models": {}}
+        ep_name = url_to_ep[ep_key]
+        endpoints[ep_name]["models"][alias] = {"modelName": mn}
+        all_aliases.append(alias)
+
+    routing = {}
+    if all_aliases:
+        try:
+            s = load_merged_ccms_settings()
+            active = s.get("env", {}).get("CCMS_MODEL_ALIAS")
+            if not active or active not in all_aliases:
+                active = all_aliases[0]
+        except Exception:
+            active = all_aliases[0]
+        routing = {"opus": active, "sonnet": active, "haiku": active, "subagent": active}
+
+    return {"endpoints": endpoints, "routing": routing}
 
 def save_custom_models(models: dict):
-    os.makedirs(os.path.dirname(CUSTOM_MODELS_PATH), exist_ok=True)
-    with open(CUSTOM_MODELS_PATH, "w", encoding="utf-8") as f:
+    os.makedirs(os.path.dirname(MODELS_PATH), exist_ok=True)
+    with open(MODELS_PATH, "w", encoding="utf-8") as f:
         json.dump(models, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
@@ -670,6 +756,14 @@ def load_merged_ccms_settings() -> dict:
         merged["env"] = merged_env
     return merged
 
+_CCMS_MANAGED_ENV_KEYS = (
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CCMS_MODEL_ALIAS",
+    "CLAUDE_CODE_SUBAGENT_MODEL",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CCMS_ENDPOINT",
+)
+
+
 def _migrate_ccms_fields_from_project():
     """从 .claude/settings.json 移除 CCMS 托管字段。
 
@@ -683,7 +777,7 @@ def _migrate_ccms_fields_from_project():
         return
     env = settings.get("env", {})
     changed = False
-    for key in ("ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CCMS_MODEL_ALIAS", "CLAUDE_CODE_SUBAGENT_MODEL"):
+    for key in _CCMS_MANAGED_ENV_KEYS:
         if key in env:
             del env[key]
             changed = True
@@ -701,70 +795,164 @@ def _migrate_ccms_fields_from_project():
             json.dump(settings, f, indent=2, ensure_ascii=False)
             f.write("\n")
 
+def _model_aliases(v2_data: dict) -> list[str]:
+    """所有模型别名"""
+    result = []
+    for ep in v2_data.get("endpoints", {}).values():
+        result.extend(ep.get("models", {}).keys())
+    return result
+
+
+def _iter_models(v2_data: dict):
+    """遍历 (alias, flat_config)"""
+    for ep_name, ep in v2_data.get("endpoints", {}).items():
+        for alias, m in ep.get("models", {}).items():
+            yield alias, _model_flat_config(v2_data, alias)
+
+
+def _find_model(v2_data: dict, alias: str):
+    """返回 (ep_name, model_dict) 或 (None, None)"""
+    for ep_name, ep in v2_data.get("endpoints", {}).items():
+        if alias in ep.get("models", {}):
+            return ep_name, ep["models"][alias]
+    return None, None
+
+
 def resolve_model(target: str, models: dict) -> tuple[str, dict] | None:
     """通过别名或 modelName 查找模型，返回 (alias, config)"""
-    if target in models:
-        return target, models[target]
-    for alias, cfg in models.items():
-        if cfg.get("modelName") == target:
+    for alias, cfg in _iter_models(models):
+        if alias == target or cfg["modelName"] == target:
             return alias, cfg
     return None
 
 
+def _infer_endpoint_name(url: str) -> str:
+    """从 URL hostname 推断 endpoint 名称"""
+    import re
+    m = re.search(r'//([^/:]+)', url)
+    if m:
+        host = m.group(1)
+        parts = host.split('.')
+        skip = {'com', 'org', 'net', 'io', 'v1', 'api', 'www'}
+        for candidate in reversed(parts):
+            if candidate not in skip and not candidate.isdigit():
+                return candidate
+        # 全是 skip 或数字 → 返回完整 host
+        return host
+    return "default"
+
+
+def _model_flat_config(v2_data: dict, alias: str) -> dict:
+    """合成扁平配置 {url, modelName, credential, endpoint}"""
+    ep_name, m = _find_model(v2_data, alias)
+    ep = v2_data.get("endpoints", {}).get(ep_name, {}) if ep_name else {}
+    return {
+        "url": ep.get("url", ""),
+        "modelName": (m or {}).get("modelName", alias),
+        "credential": ep.get("credential", {}),
+        "endpoint": ep_name or "",
+    }
+
+
+def _upsert_model(v2_data: dict, alias: str, url: str,
+                     model_name: str, credential: dict) -> str:
+    """在 endpoint 下新增/更新模型。返回 endpoint 名称"""
+    ep_name = _infer_endpoint_name(url)
+    endpoints = v2_data.setdefault("endpoints", {})
+    if ep_name in endpoints and endpoints[ep_name].get("url") != url:
+        i = 2
+        while f"{ep_name}-{i}" in endpoints:
+            i += 1
+        ep_name = f"{ep_name}-{i}"
+    if ep_name not in endpoints:
+        endpoints[ep_name] = {"url": url, "credential": credential, "models": {}}
+    endpoints[ep_name].setdefault("models", {})[alias] = {"modelName": model_name}
+    routing = v2_data.setdefault("routing", {})
+    if not routing:
+        routing.update({"opus": alias, "sonnet": alias,
+                        "haiku": alias, "subagent": alias})
+    return ep_name
+
+
+def _delete_model(v2_data: dict, alias: str) -> bool:
+    """从 endpoint 下删除模型并清理路由引用"""
+    for ep in v2_data.get("endpoints", {}).values():
+        if alias in ep.get("models", {}):
+            del ep["models"][alias]
+            break
+    else:
+        return False
+    for role, a in list(v2_data.get("routing", {}).items()):
+        if a == alias:
+            del v2_data["routing"][role]
+    return True
+
+
 def get_current_alias(models: dict) -> str | None:
-    """返回当前项目设置的模型别名。
-    优先读 CCMS_MODEL_ALIAS（本工具写入），否则从 ANTHROPIC_MODEL 反查。
-    未找到别名的返回 ANTHROPIC_MODEL 原始值（非托管）。"""
+    """返回当前项目设置的模型别名。"""
     s = load_merged_ccms_settings()
     env = s.get("env", {})
     current_model = env.get("ANTHROPIC_MODEL", None)
     if not current_model:
         return None
-    # 优先读本工具写入的 alias 标记
     alias_tag = env.get("CCMS_MODEL_ALIAS", None)
-    if alias_tag and alias_tag in models:
+    if alias_tag and _find_model(models, alias_tag)[0]:
         return alias_tag
-    # 反查 modelName
-    for alias, cfg in models.items():
-        if cfg.get("modelName") == current_model or alias == current_model:
+    for alias, cfg in _iter_models(models):
+        if cfg["modelName"] == current_model or alias == current_model:
             return alias
-    return current_model  # 非托管，返回原始值
+    return current_model
 
 # ============================================================
 # 模型配置兼容: 旧版 sk 字段 → 迁移到凭据后端
 # ============================================================
 
-def migrate_models(models: dict) -> dict:
-    """迁移旧格式: 补 modelName 字段 + sk→credential"""
-    changed = False
-    for alias, cfg in models.items():
-        if "modelName" not in cfg:
-            cfg["modelName"] = alias
-            changed = True
-        if "sk" in cfg and "credential" not in cfg:
-            sk = cfg.pop("sk")
-            if sk:
-                cred = cred_default_config(alias)
-                cred_store(cred, sk)
-                cfg["credential"] = cred
-                changed = True
-    if changed:
-        save_custom_models(models)
-    return models
+
+
 
 # ============================================================
 # 写项目配置 + helper 脚本
 # ============================================================
 
-def write_model_to_project(alias: str, model_config: dict):
-    """写入项目 .claude/settings.local.json (env 不含 sk) 并生成 helper 脚本"""
+_ROLE_ENV_MAP = [
+    ("opus",     "ANTHROPIC_DEFAULT_OPUS_MODEL"),
+    ("sonnet",   "ANTHROPIC_DEFAULT_SONNET_MODEL"),
+    ("haiku",    "ANTHROPIC_DEFAULT_HAIKU_MODEL"),
+    ("subagent", "CLAUDE_CODE_SUBAGENT_MODEL"),
+]
+
+
+def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None):
+    """写入项目 .claude/settings.local.json (env 不含 sk) 并生成 helper 脚本。
+
+    当 v2_data 提供时，按 routing 表写入 4 路独立 env var；
+    否则回退到旧版单模型模式（4 路指向同一模型）。"""
     settings = load_local_settings()
     if "env" not in settings:
         settings["env"] = {}
-    settings["env"]["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
-    settings["env"]["ANTHROPIC_MODEL"] = model_config.get("modelName", alias)
-    settings["env"]["CCMS_MODEL_ALIAS"] = alias  # 本工具管理标记
-    settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"] = model_config.get("modelName", alias)
+    env = settings["env"]
+
+    # 写 4 路路由 env var
+    if v2_data and v2_data.get("routing"):
+        routing = v2_data["routing"]
+        for role, env_key in _ROLE_ENV_MAP:
+            target_alias = routing.get(role)
+            if target_alias and _find_model(v2_data, target_alias)[0]:
+                target_cfg = _model_flat_config(v2_data, target_alias)
+                env[env_key] = target_cfg.get("modelName", target_alias)
+    else:
+        # 无路由表时 4 路全部指向当前模型
+        mn = model_config.get("modelName", alias)
+        for _, env_key in _ROLE_ENV_MAP:
+            env[env_key] = mn
+
+    # 向后兼容字段 + 活跃 endpoint 标记
+    env["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
+    env["ANTHROPIC_MODEL"] = model_config.get("modelName", alias)
+    env["CCMS_MODEL_ALIAS"] = alias
+    if v2_data:
+        env["CCMS_ENDPOINT"] = _active_endpoint(v2_data) or ""
+
     if _detect_platform() == "windows":
         settings["apiKeyHelper"] = "powershell -NoProfile -Command .claude\\get-sk.ps1"
     else:
@@ -875,7 +1063,7 @@ def print_env_export(alias: str, model_config: dict):
 def cmd_env(args: list[str]):
     """--env 模式: 输出 export 命令"""
     models = load_custom_models()
-    models = migrate_models(models)
+
     current = get_current_alias(models)
     target_arg = args[0] if args else current
     if target_arg:
@@ -900,7 +1088,7 @@ def cmd_env(args: list[str]):
 def cmd_get_sk(args: list[str]):
     """--get-sk 模式: 输出原始 sk（供 apiKeyHelper 调用）"""
     models = load_custom_models()
-    models = migrate_models(models)
+
     target = args[0] if args else get_current_alias(models)
     if target:
         result = resolve_model(target, models)
@@ -920,33 +1108,48 @@ def cmd_get_sk(args: list[str]):
         sys.exit(1)
 
 def cmd_reveal():
-    """--reveal 模式: 展示所有模型凭据状态（用于迁移）"""
+    """--reveal 模式: 展示所有模型凭据状态 + 路由配置（用于迁移）"""
     models = load_custom_models()
-    models = migrate_models(models)
-    if not models:
+
+    aliases = _model_aliases(models)
+    if not aliases:
         _print_color("没有配置任何模型\n", color="\033[33m")
         return
     print(f"平台: {_detect_platform()}")
     print(f"可用凭据后端: {', '.join(cred_available_backends())}")
     print()
-    print(f"{'别名':<20} {'modelName':<25} {'凭据后端':<20} {'状态':<10} sk")
-    print("-" * 95)
-    result = {}
-    for alias, cfg in models.items():
+    print(f"{'别名':<20} {'modelName':<25} {'endpoint':<15} {'凭据后端':<20} {'状态':<10} sk")
+    print("-" * 105)
+    for alias, cfg in _iter_models(models):
         mn = cfg.get("modelName", alias)
         cred = cfg.get("credential", {})
         backend = cred.get("type", "无")
         sk = _get_sk(alias, cfg)
         status = "\033[32m可用\033[0m" if sk else "\033[31m不可用\033[0m"
         sk_preview = (sk[:8] + "...") if sk else "-"
-        print(f"{alias:<20} {mn:<25} {backend:<20} {status:<10} {sk_preview}")
-        result[alias] = {"modelName": mn, "credential": cred, "sk": sk or ""}
+        ep = cfg.get("endpoint", "")
+        print(f"{alias:<20} {mn:<25} {ep:<15} {backend:<20} {status:<10} {sk_preview}")
+    # 路由表
+    routing = models.get("routing", {})
+    if routing:
+        print(f"\n{'':-^105}")
+        _print_color("路由配置 (Routing)\n", bold=True)
+        print(f"  {'角色':<12} {'别名':<20} {'modelName':<28} {'endpoint':<15}")
+        print(f"  {'-'*75}")
+        for role in ("opus", "sonnet", "haiku", "subagent"):
+            alias = routing.get(role, "（未设置）")
+            cfg = _model_flat_config(models, alias)
+            mn = cfg.get("modelName", alias)
+            ep = cfg.get("endpoint", "")
+            print(f"  {role:<12} {alias:<20} {mn:<28} {ep:<15}")
+    else:
+        _print_color("\n（未配置路由映射）\n", color="\033[33m")
     print()
     if confirm("导出全部 sk 到 stdout（JSON 格式，用于迁移）？", default_no=True):
         out = {}
-        for name, cfg in models.items():
-            sk = _get_sk(name, cfg)
-            out[name] = {"url": cfg.get("url", ""), "credential": cfg.get("credential", {}),
+        for alias, cfg in _iter_models(models):
+            sk = _get_sk(alias, cfg)
+            out[alias] = {"url": cfg.get("url", ""), "credential": cfg.get("credential", {}),
                          "sk": sk or ""}
         print(json.dumps(out, indent=2, ensure_ascii=False))
 
@@ -964,19 +1167,18 @@ def cmd_migrate_import():
         if not entry.get("sk"):
             continue
         mn = entry.get("modelName", alias)
-        if alias in models:
-            cred = cred_default_config(alias)
-            cred_store(cred, entry["sk"])
-            models[alias]["credential"] = cred
-            models[alias]["modelName"] = mn
+        url = entry.get("url", "")
+        cred = cred_default_config(alias)
+        cred_store(cred, entry["sk"])
+        ep_name, existing = _find_model(models, alias)
+        if existing:
+            if ep_name in models.get("endpoints", {}):
+                models["endpoints"][ep_name]["credential"] = cred
+            existing["modelName"] = mn
             imported += 1
             print(f"  ✔ {alias} → {mn}")
         else:
-            cred = cred_default_config(alias)
-            cred_store(cred, entry["sk"])
-            models[alias] = {"url": entry.get("url", ""),
-                             "modelName": mn,
-                             "credential": cred}
+            _upsert_model(models, alias, url, mn, cred)
             imported += 1
             print(f"  ✔ {alias} → {mn} (新建)")
     save_custom_models(models)
@@ -1247,300 +1449,438 @@ def get_env_info_lines() -> list[tuple[str, str]]:
 
     # ── 全局 (~/.claude/) ──
     models = load_custom_models()
-    names = list(models.keys())
+    names = _model_aliases(models)
     if names:
-        lines.append(("全局模型", f"~/.claude/custom-models.json — {len(names)} 个模型", ""))
+        lines.append(("全局模型", f"~/.claude/ccms-endpoints.json — {len(names)} 个模型", ""))
     else:
-        lines.append(("全局模型", "~/.claude/custom-models.json — 未配置", "yellow"))
+        lines.append(("全局模型", "~/.claude/ccms-endpoints.json — 未配置", "yellow"))
 
     return lines
+
+# ============================================================
+# 路由管理
+# ============================================================
+
+def _endpoint_menu(v2_data: dict):
+    """Endpoint 管理子菜单：创建 / 删除。"""
+    while True:
+        print("\033[2J\033[H", end="")
+        width = shutil.get_terminal_size().columns
+        _print_color(f"{' 管理 Endpoints ':=^{width}}\n", bold=True)
+
+        endpoints = v2_data.get("endpoints", {})
+        if endpoints:
+            for ep_name, ep_cfg in endpoints.items():
+                url = ep_cfg.get("url", "")
+                model_list = list(ep_cfg.get("models", {}).keys())
+                cred = ep_cfg.get("credential", {})
+                sk_ok = bool(cred and cred_retrieve(cred))
+                status = "\033[32m✓\033[0m" if sk_ok else "\033[31m✗\033[0m"
+                _print_color(f"  {status} {ep_name}  ", bold=True)
+                _print_color(f"{url}", dim=True)
+                _print_color(f"  ({len(model_list)} 个模型)\n", dim=True)
+            print()
+        else:
+            _print_color("  暂无 Endpoint\n\n", dim=True)
+
+        menu_items = ["创建 Endpoint"]
+        if endpoints:
+            menu_items.append("重命名 Endpoint")
+            menu_items.append("删除 Endpoint")
+        menu_items.append("返回主菜单")
+
+        idx = select_from_list(menu_items, prompt="↑↓ 选择 Enter 确认  ESC 返回")
+        if idx is None or idx == len(menu_items) - 1:
+            return
+
+        if idx == 0:  # 创建
+            print("\n\033[1m创建 Endpoint\033[0m")
+            url = input_with_prompt("API URL: ")
+            if not url: continue
+            default_name = _infer_endpoint_name(url)
+            ep_name = input_with_prompt(f"名称 [{default_name}]: ")
+            if not ep_name:
+                ep_name = default_name
+            if ep_name in endpoints:
+                i = 2
+                while f"{ep_name}-{i}" in endpoints:
+                    i += 1
+                _print_color(f"  名称已存在，自动改为: {ep_name}-{i}\n", color="\033[33m")
+                ep_name = f"{ep_name}-{i}"
+            sk = input_with_prompt("API Key (sk-...): ")
+            cred = cred_default_config(ep_name)
+            cred_store(cred, sk)
+            endpoints[ep_name] = {"url": url, "credential": cred, "models": {}}
+            save_custom_models(v2_data)
+            _print_color(f"✔ Endpoint \"{ep_name}\" 已创建\n", color="\033[32m")
+            _press_enter()
+
+        elif idx == 1 and endpoints:  # 重命名
+            ep_names = list(endpoints.keys())
+            sel = select_from_list(ep_names, title="选择要重命名的 Endpoint")
+            if sel is not None:
+                old_name = ep_names[sel]
+                new_name = input_with_prompt(f"新名称 [{old_name}]: ")
+                if new_name and new_name != old_name:
+                    if new_name in endpoints:
+                        _print_color("名称已存在\n", color="\033[31m")
+                    else:
+                        endpoints[new_name] = endpoints.pop(old_name)
+                        # 如果重命名的是活跃 endpoint，更新 CCMS_ENDPOINT
+                        if _active_endpoint(v2_data) is None:  # 旧名已不在
+                            s = load_local_settings()
+                            if s.get("env", {}).get("CCMS_ENDPOINT") == old_name:
+                                s["env"]["CCMS_ENDPOINT"] = new_name
+                                save_local_settings(s)
+                        save_custom_models(v2_data)
+                        _print_color(f"✔ {old_name} → {new_name}\n", color="\033[32m")
+            _press_enter()
+
+        elif idx == 2 and endpoints:  # 删除
+            ep_names = list(endpoints.keys())
+            sel = select_from_list(ep_names, title="选择要删除的 Endpoint（其下模型将同时删除）")
+            if sel is not None:
+                ep_name = ep_names[sel]
+                affected = list(endpoints[ep_name].get("models", {}).keys())
+                _print_color(f"\n⚠  将删除 {ep_name} 及其 {len(affected)} 个模型\n", color="\033[31m")
+                if confirm(f"确定删除？", default_no=True):
+                    cred = endpoints[ep_name].get("credential", {})
+                    if cred:
+                        try: cred_delete(cred)
+                        except Exception: pass
+                    for alias in affected:
+                        _delete_model(v2_data, alias)
+                    del endpoints[ep_name]
+                    save_custom_models(v2_data)
+                    _print_color(f"✔ 已删除\n", color="\033[32m")
+                    aliases = _model_aliases(v2_data)
+                    if aliases:
+                        write_model_to_project(aliases[0],
+                                               _model_flat_config(v2_data, aliases[0]), v2_data)
+            _press_enter()
+
 
 # ============================================================
 # 主菜单
 # ============================================================
 
+def _active_endpoint(models: dict) -> str | None:
+    """返回当前活跃的 endpoint 名。优先读 CCMS_ENDPOINT，fallback URL 匹配。"""
+    s = load_merged_ccms_settings()
+    ep_tag = s.get("env", {}).get("CCMS_ENDPOINT", "")
+    if ep_tag and ep_tag in models.get("endpoints", {}):
+        return ep_tag
+    # fallback: URL 匹配（旧项目无 CCMS_ENDPOINT）
+    base_url = s.get("env", {}).get("ANTHROPIC_BASE_URL", "")
+    if base_url:
+        for ep_name, ep in models.get("endpoints", {}).items():
+            if ep.get("url", "") == base_url:
+                return ep_name
+    routing = models.get("routing", {})
+    for role in ("sonnet", "opus", "haiku", "subagent"):
+        alias = routing.get(role)
+        if alias:
+            ep_name, _ = _find_model(models, alias)
+            if ep_name:
+                return ep_name
+    eps = list(models.get("endpoints", {}).keys())
+    return eps[0] if eps else None
+
+
+_ROLE_LABELS = [("opus", "Opus"), ("sonnet", "Sonnet"),
+                ("haiku", "Haiku"), ("subagent", "Subagent")]
+
+
+def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str]):
+    """交互式路由编辑：↑↓ 选角色，← → 切模型，Enter 确认。"""
+    if not model_aliases:
+        _print_color("当前 endpoint 下无可用模型\n", color="\033[33m")
+        _press_enter()
+        return
+
+    routing = v2_data.setdefault("routing", {})
+    # 每个角色当前选的 model index（-1 = 清空）
+    options = model_aliases + ["（清空）"]
+    selected_role = 0
+    model_indices = []
+    for role_key, _ in _ROLE_LABELS:
+        cur = routing.get(role_key)
+        model_indices.append(model_aliases.index(cur) if cur in model_aliases else len(options) - 1)
+
+    n_roles = len(_ROLE_LABELS)
+    total_lines = n_roles + 3  # title + prompt + roles + blank
+
+    first = [True]
+
+    def render():
+        if first[0]:
+            first[0] = False
+        else:
+            _clear_lines(total_lines)
+        _print_color(f"修改路由 ({active_ep} 下的模型)\n", bold=True)
+        _print_color("↑↓ 选角色  ← → 切模型  Enter 确认  ESC 放弃\n", dim=True)
+        for i, (role_key, role_label) in enumerate(_ROLE_LABELS):
+            mi = model_indices[i]
+            cur_model = options[mi]
+            prefix = "\033[7m > \033[0m" if i == selected_role else "   "
+            arrow = "  ◀ ▶" if i == selected_role else ""
+            _print_color(f"{prefix}{role_label:<10} → {cur_model}{arrow}\n")
+        print()
+
+    render()
+    while True:
+        ch = _getch()
+        if ch == "\xe0":
+            ch2 = _getch()
+            if ch2 == "H":  # ↑
+                selected_role = (selected_role - 1) % n_roles
+            elif ch2 == "P":  # ↓
+                selected_role = (selected_role + 1) % n_roles
+            elif ch2 == "K":  # ←
+                model_indices[selected_role] = (model_indices[selected_role] - 1) % len(options)
+            elif ch2 == "M":  # →
+                model_indices[selected_role] = (model_indices[selected_role] + 1) % len(options)
+            else:
+                continue
+        elif ch == "\x1b":
+            ch2 = _getch()
+            if ch2 == "[":
+                ch3 = _getch()
+                if ch3 == "A":  # ↑
+                    selected_role = (selected_role - 1) % n_roles
+                elif ch3 == "B":  # ↓
+                    selected_role = (selected_role + 1) % n_roles
+                elif ch3 == "C":  # →
+                    model_indices[selected_role] = (model_indices[selected_role] + 1) % len(options)
+                elif ch3 == "D":  # ←
+                    model_indices[selected_role] = (model_indices[selected_role] - 1) % len(options)
+                else:
+                    continue
+            elif ch2 == "\x1b":
+                _clear_lines(total_lines)
+                return
+            else:
+                continue
+        elif ch in ("\r", "\n"):
+            break
+        elif ch == "\x03" or not ch:
+            _clear_lines(total_lines)
+            raise KeyboardInterrupt
+        else:
+            continue
+        render()
+
+    # 应用变更
+    _clear_lines(total_lines)
+    for i, (role_key, _) in enumerate(_ROLE_LABELS):
+        mi = model_indices[i]
+        if mi == len(options) - 1:
+            routing.pop(role_key, None)
+        else:
+            routing[role_key] = model_aliases[mi]
+    save_custom_models(v2_data)
+    if routing:
+        rep = routing.get("sonnet") or list(routing.values())[0]
+        write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data)
+    _print_color("✔ 路由已更新\n", color="\033[32m")
+    _press_enter()
+
+
 def main():
     _setup_console()
-
     models = load_custom_models()
-    models = migrate_models(models)
-
-    current = get_current_alias(models)
-
-    # 启动时检查 gitignore 配置
     _ensure_gitignore()
 
     while True:
         print("\033[2J\033[H", end="")
         width = shutil.get_terminal_size().columns
-        _print_color(f"{' Claude 模型切换器 ':=^{width}}\n", bold=True)
+        _print_color(f"{' CCMS ':=^{width}}\n", bold=True)
 
-        # 当前目录
         cwd = os.getcwd()
-        _print_color("  📁 当前目录: ", dim=True)
-        _print_color(f"{cwd}\n", dim=True)
+        _print_color(f"  📁 {cwd}", dim=True)
         if is_global_config_dir():
-            _print_color("  ⚠  当前处于用户目录，将编辑全局默认配置\n", color="\033[33m", bold=True)
+            _print_color("  ⚠ 全局配置模式", color="\033[33m")
         print()
 
-        # 渲染环境信息，按分区展示
-        info = get_env_info_lines()
-        last_section = None
-        sections = {
-            "系统": "系统信息 (System)",
-            "凭据后端": None,
-            "项目路径": "当前项目 (.claude/settings.local.json + settings.json)",
-            "配置文件": None,
-            "apiKeyHelper": None,
-            "⚠ 冲突": None,
-            "全局模型": "全局配置 (~/.claude/custom-models.json)",
-        }
-        for label, value, color in info:
-            if label in sections and sections[label] is not None:
-                _print_color(f"  ── {sections[label]} ", dim=True)
-                print("─" * max(1, width - 6 - len(sections[label])))
-            # 渲染行
-            if not label:
-                # 无标签行（续行），多缩进
-                _print_color("     ", dim=True)
-            elif label == "⚠ 冲突":
-                _print_color("  ⚠ ", dim=True)
+        endpoints = models.get("endpoints", {})
+        routing = models.get("routing", {})
+        active_ep = _active_endpoint(models)
+
+        # ── 活跃 Endpoint ──
+        if active_ep and active_ep in endpoints:
+            ep = endpoints[active_ep]
+            cred = ep.get("credential", {})
+            sk_ok = bool(cred and cred_retrieve(cred))
+            _print_color(f"  ★ {active_ep}", bold=True)
+            _print_color(f"  {ep.get('url', '')}", dim=True)
+            _print_color(f"  凭据: ", dim=True)
+            if sk_ok:
+                _print_color("✓\n", color="\033[32m")
             else:
-                _print_color(f"  {label}: ", dim=True)
-            # 值着色
-            col = ""
-            if color == "green": col = "\033[32m"
-            elif color == "yellow": col = "\033[33m"
-            elif color == "red": col = "\033[31m"
-            _print_color(f"{value}\n", color=col)
+                _print_color("✗\n", color="\033[31m")
+            print()
 
-        print()
-        # 检测托管状态（从 merged settings 读取，local 覆盖 project）
-        merged = load_merged_ccms_settings()
-        managed_alias = merged.get("env", {}).get("CCMS_MODEL_ALIAS", None)
-        if managed_alias:
-            _print_color(f"  ★ 模型: ", dim=True)
-            _print_color(f"{managed_alias}", bold=True)
-            mn = merged.get("env", {}).get("ANTHROPIC_MODEL", "")
-            if mn and mn != managed_alias:
-                _print_color(f" → {mn}", dim=True)
-            _print_color("\n", dim=True)
-        elif current:
-            an_model = merged.get("env", {}).get("ANTHROPIC_MODEL", "?")
-            _print_color(f"  ⚠ 未托管 model-switcher", color="\033[33m")
-            _print_color(f"，当前 ANTHROPIC_MODEL: {an_model}\n", dim=True)
+            # ── 模型列表 ──
+            ep_models = ep.get("models", {})
+            model_aliases = list(ep_models.keys())
+            if model_aliases:
+                _print_color("  模型\n", bold=True)
+                for ma in model_aliases:
+                    mn = ep_models[ma].get("modelName", ma)
+                    _print_color(f"  {ma}  →  {mn}\n", dim=True)
+            else:
+                _print_color("  模型: （空）\n", dim=True)
+            print()
+
+            # ── 路由表 ──
+            _print_color("  路由\n", bold=True)
+            for role_key, role_label in _ROLE_LABELS:
+                r_alias = routing.get(role_key, "—")
+                in_ep = r_alias in model_aliases
+                col = "" if in_ep else "\033[33m"
+                _print_color(f"  {role_label:<10} → {r_alias}\n", color=col)
+            print()
+            _print_color("  " + "─" * 40 + "\n", dim=True)
+
+            # ── 菜单 ──
+            menu_items = ["切换 Endpoint", "添加模型"]
+            if model_aliases:
+                menu_items.append("删除模型")
+            menu_items.append("修改路由")
+            menu_items.append("修改凭据")
+            menu_items.append("管理 Endpoints")
+            menu_items.append("查看所有凭据")
+            menu_items.append("退出")
         else:
-            _print_color(f"  ⚠ 未配置 ANTHROPIC_MODEL\n", dim=True)
-        print()
-
-        names = list(models.keys())
-        menu_items = []
-        _in_global = is_global_config_dir()
-        if names:
-            if _in_global:
-                menu_items.append("切换全局默认模型")
-            else:
-                menu_items.append("切换模型")
-        menu_items.append("添加模型")
-        if names: menu_items.append("删除模型")
-        menu_items.append("查看凭据状态")
-        menu_items.append("退出")
+            _print_color("  暂无可用 Endpoint\n", color="\033[33m")
+            menu_items = ["创建 Endpoint", "退出"]
 
         idx = select_from_list(menu_items, prompt="↑↓ 选择 Enter 确认  ESC 退出")
         if idx is None:
             break
 
         choice = menu_items[idx]
+        ep_models = endpoints.get(active_ep, {}).get("models", {}) if active_ep else {}
+        model_aliases = list(ep_models.keys())
 
-        # ---- 切换 ----
-        if choice in ("切换模型", "切换全局默认模型"):
-            sel = select_from_list(names, title="选择要切换的模型")
-            if sel is None: continue
-            alias = names[sel]
-            cfg = models[alias]
-            sk = _get_sk(alias, cfg)
-            if not sk:
-                _print_color(f"⚠  模型 \"{alias}\" 的凭据不可用\n", color="\033[33m")
-                if confirm("重新设置 API Key？"):
-                    new_sk = input_with_prompt("API Key (sk-...): ")
-                    cred = cfg.get("credential", cred_default_config(alias))
-                    cred_store(cred, new_sk)
-                    cfg["credential"] = cred
-                    models[alias] = cfg
-                    save_custom_models(models)
-                else:
-                    continue
-            if is_global_config_dir():
-                _print_color(f"\n⚠ 当前处于用户目录 (~)\n", color="\033[33m", bold=True)
-                _print_color(f"   即将编辑全局默认配置: ~/.claude/settings.local.json\n", color="\033[33m")
-                _print_color(f"   这将影响所有未单独配置 Claude Code 的项目！\n", color="\033[33m")
-                if not confirm("确定要修改全局配置吗？", default_no=True):
-                    continue
-                _backup_user_settings_json_once()
-            write_model_to_project(alias, cfg)
-            current = alias
-            mn = cfg.get("modelName", alias)
-            _print_color(f"✔ 已切换至: {alias} (modelName: {mn})\n", color="\033[32m")
-            # 切换后检查高优先级环境变量
-            high_prio = _check_high_priority_env_vars()
-            if high_prio:
-                _print_color(f"\n⚠ 以下文件配置了高优先级的认证变量，", color="\033[33m")
-                _print_color(f"优先级高于 apiKeyHelper：\n", color="\033[33m")
-                for label, key in high_prio:
-                    _print_color(f"  · {label} → {key}\n", color="\033[33m")
-                _print_color(
-                    f"  这些变量会覆盖 apiKeyHelper 返回的凭据，"
-                    f"如果模型 API 认证失败，请检查并移除这些配置。\n",
-                    color="\033[33m")
-            print_env_export(alias, cfg)
-            _press_enter()
-            continue
+        # ---- 切换 Endpoint ----
+        if choice == "切换 Endpoint":
+            ep_names = list(endpoints.keys())
+            sel = select_from_list(ep_names, title="选择 Endpoint")
+            if sel is not None:
+                ep_name = ep_names[sel]
+                ep_models_sel = endpoints[ep_name].get("models", {})
+                aliases_sel = list(ep_models_sel.keys())
+                # 重置 routing 为该 endpoint 的模型
+                if aliases_sel:
+                    first = aliases_sel[0]
+                    models["routing"] = {r: first for r, _ in _ROLE_LABELS}
+                # 先写 CCMS_ENDPOINT 再调 write_model_to_project
+                settings = load_local_settings()
+                settings.setdefault("env", {})["CCMS_ENDPOINT"] = ep_name
+                save_local_settings(settings)
+                cfg = _model_flat_config(models, aliases_sel[0]) if aliases_sel else {"url": endpoints[ep_name].get("url", ""), "modelName": "", "credential": {}}
+                write_model_to_project(aliases_sel[0] if aliases_sel else "none", cfg, models)
+                save_custom_models(models)
+                _print_color(f"✔ 已切换至 {ep_name}，路由已重置\n", color="\033[32m")
+                _press_enter()
 
-        # ---- 添加 ----
+        # ---- 添加模型 (在当前 endpoint 下) ----
         elif choice == "添加模型":
-            print("\n\033[1m添加新模型\033[0m")
+            print(f"\n\033[1m添加模型 → {active_ep}\033[0m")
+            print(f"  URL: {endpoints[active_ep].get('url', '')}")
+            print(f"  （凭据继承 endpoint，无需重新输入 Key）\n")
             alias = input_with_prompt("别名: ")
             if not alias: continue
             mn = input_with_prompt("模型名 (modelName): ")
             if not mn: continue
+            ep = endpoints[active_ep]
+            _upsert_model(models, alias, ep["url"], mn, ep.get("credential", {}))
+            save_custom_models(models)
+            # 如果路由为空，自动路由到新模型
+            if not models.get("routing"):
+                models["routing"] = {r: alias for r, _ in _ROLE_LABELS}
+                cfg = _model_flat_config(models, alias)
+                write_model_to_project(alias, cfg, models)
+                save_custom_models(models)
+            _print_color(f"✔ 已添加: {alias} → {mn}\n", color="\033[32m")
+            _press_enter()
+
+        # ---- 删除模型 ----
+        elif choice == "删除模型":
+            sel = select_from_list(model_aliases, title=f"删除 {active_ep} 下的模型")
+            if sel is not None:
+                alias = model_aliases[sel]
+                if confirm(f"确定删除 \"{alias}\" 吗？", default_no=True):
+                    _delete_model(models, alias)
+                    save_custom_models(models)
+                    if models.get("routing"):
+                        rep = models["routing"].get("sonnet") or _model_aliases(models)[0]
+                        write_model_to_project(rep, _model_flat_config(models, rep), models)
+                    _print_color(f"✔ 已删除\n", color="\033[32m")
+            _press_enter()
+
+        # ---- 修改路由 ----
+        elif choice == "修改路由":
+            _routing_picker(models, active_ep, model_aliases)
+            # 重载（routing 可能已变更）
+            routing = models.get("routing", {})
+
+        # ---- 修改凭据 ----
+        elif choice == "修改凭据":
+            _print_color(f"\n修改 {active_ep} 的 API Key\n", bold=True)
+            new_sk = input_with_prompt("新的 API Key (sk-...): ")
+            if new_sk:
+                cred = cred_default_config(active_ep)
+                cred_store(cred, new_sk)
+                endpoints[active_ep]["credential"] = cred
+                save_custom_models(models)
+                if model_aliases:
+                    write_model_to_project(model_aliases[0],
+                                           _model_flat_config(models, model_aliases[0]), models)
+                _print_color(f"✔ 凭据已更新\n", color="\033[32m")
+            _press_enter()
+
+        # ---- 管理 Endpoints ----
+        elif choice == "管理 Endpoints":
+            _endpoint_menu(models)
+            _press_enter()
+
+        # ---- 创建 Endpoint (无 endpoint 时的初始状态) ----
+        elif choice == "创建 Endpoint":
+            print("\n\033[1m创建 Endpoint\033[0m")
             url = input_with_prompt("API URL: ")
-            sk = input_with_prompt("API Key (sk-...): ")
-
-            if alias in models:
-                if not confirm(f"别名 \"{alias}\" 已存在，覆盖吗？", default_no=True):
-                    continue
-
-            cred = cred_default_config(alias)
-            try:
-                cred_store(cred, sk)
-            except RuntimeError as e:
-                err_lower = str(e).lower()
-                if "locked" in err_lower:
-                    _print_color("\n⚠  凭据后端被锁定\n", color="\033[33m")
-                    if not confirm("要解锁 Keyring 吗？"):
-                        _press_enter()
-                        continue
-                    if not _unlock_linux_keyring():
-                        _press_enter()
-                        continue
-                    try:
-                        cred_store(cred, sk)
-                    except Exception as ex:
-                        _print_color(
-                            f"✘ 存储凭据仍然失败: {ex}\n",
-                            color="\033[31m")
-                        _press_enter()
-                        continue
-                elif "timeout" in err_lower or \
-                     "startservicebyname" in err_lower:
-                    _print_color(
-                        "\n⚠  secret-service 服务不可用 (D-Bus 超时)\n",
-                        color="\033[33m")
-                    print("  eval $(gnome-keyring-daemon --start "
-                          "--components=secrets --daemonize)")
-                    print("  export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK")
-                    _press_enter()
-                    continue
-                else:
-                    _print_color(f"\n✘ 凭据存储失败: {e}\n",
-                                 color="\033[31m")
-                    _press_enter()
-                    continue
-            except FileNotFoundError as e:
-                _print_color(f"\n✘ 未找到加密工具: {e.filename or e}\n"
-                             f"   请安装 age: sudo apt install age\n",
-                             color="\033[31m")
+            if not url: continue
+            default_name = _infer_endpoint_name(url)
+            ep_name = input_with_prompt(f"名称 [{default_name}]: ")
+            if not ep_name:
+                ep_name = default_name
+            if ep_name in endpoints:
+                _print_color("名称已存在\n", color="\033[31m")
                 _press_enter()
                 continue
-            models[alias] = {"url": url, "modelName": mn, "credential": cred}
+            sk = input_with_prompt("API Key (sk-...): ")
+            cred = cred_default_config(ep_name)
+            cred_store(cred, sk)
+            endpoints[ep_name] = {"url": url, "credential": cred, "models": {}}
             save_custom_models(models)
-            _print_color(f"✔ 模型 \"{alias}\" → {mn} 已保存\n", color="\033[32m")
-
-            if confirm("立即切换到该模型吗？"):
-                proceed = True
-                if is_global_config_dir():
-                    _print_color(f"\n⚠ 当前处于用户目录 (~)\n", color="\033[33m", bold=True)
-                    _print_color(f"   即将编辑全局默认配置: ~/.claude/settings.local.json\n", color="\033[33m")
-                    _print_color(f"   这将影响所有未单独配置 Claude Code 的项目！\n", color="\033[33m")
-                    if not confirm("确定要修改全局配置吗？", default_no=True):
-                        proceed = False
-                    else:
-                        _backup_user_settings_json_once()
-                if proceed:
-                    write_model_to_project(alias, models[alias])
-                    current = alias
-                    _print_color(f"✔ 已切换至: {alias} (modelName: {mn})\n", color="\033[32m")
-                    # 切换后检查高优先级环境变量
-                    high_prio = _check_high_priority_env_vars()
-                    if high_prio:
-                        _print_color(f"\n⚠ 以下文件配置了高优先级的认证变量，", color="\033[33m")
-                        _print_color(f"优先级高于 apiKeyHelper：\n", color="\033[33m")
-                        for label, key in high_prio:
-                            _print_color(f"  · {label} → {key}\n", color="\033[33m")
-                        _print_color(
-                            f"  这些变量会覆盖 apiKeyHelper 返回的凭据，"
-                            f"如果模型 API 认证失败，请检查并移除这些配置。\n",
-                            color="\033[33m")
-                    print_env_export(alias, models[alias])
-
+            _print_color(f"✔ Endpoint \"{ep_name}\" 已创建\n", color="\033[32m")
             _press_enter()
-            continue
 
-        # ---- 删除 ----
-        elif choice == "删除模型":
-            if not names:
-                _press_enter("没有模型可删除。按 Enter 返回...")
-                continue
-            sel = select_from_list(names, title="选择要删除的模型")
-            if sel is None: continue
-            alias = names[sel]
-            _print_color(f"\n⚠  确认删除模型: {alias}\n", color="\033[31m")
-            if confirm(f"确定要删除 \"{alias}\" 吗？(同时清理凭据)", default_no=True):
-                cfg = models[alias]
-                cred = cfg.get("credential", {})
-                if cred:
-                    try:
-                        cred_delete(cred)
-                        _print_color(f"  ✔ 凭据已清理\n", color="\033[32m")
-                    except Exception as e:
-                        _print_color(f"  ⚠ 凭据清理失败: {e}\n", color="\033[33m")
-                del models[alias]
-                save_custom_models(models)
-                if current == alias:
-                    current = None
-                _print_color(f"✔ 已删除: {alias}\n", color="\033[32m")
-            else:
-                print("已取消删除")
-            _press_enter()
-            continue
-
-        # ---- 查看凭据状态 ----
-        elif choice == "查看凭据状态":
-            print(f"\n{'别名':<20} {'modelName':<25} {'凭据后端':<22} {'状态':<10} sk")
-            print("-" * 95)
-            for alias, cfg in models.items():
+        # ---- 查看所有凭据 ----
+        elif choice == "查看所有凭据":
+            print(f"\n{'别名':<20} {'modelName':<25} {'endpoint':<15} {'凭据后端':<22} {'状态':<10} sk")
+            print("-" * 110)
+            for alias, cfg in _iter_models(models):
                 mn = cfg.get("modelName", alias)
                 cred = cfg.get("credential", {})
                 backend = cred.get("type", "无")
                 sk = _get_sk(alias, cfg)
                 status = "\033[32m可用\033[0m" if sk else "\033[31m不可用\033[0m"
                 sk_preview = (sk[:8] + "...") if sk else "-"
-                print(f"{alias:<20} {mn:<25} {backend:<22} {status:<10} {sk_preview}")
-            print()
-            if confirm("重新设置某个模型的 API Key？"):
-                sel = select_from_list(names, title="选择模型")
-                if sel is not None:
-                    alias = names[sel]
-                    new_sk = input_with_prompt(f"新的 API Key ({alias}): ")
-                    cfg = models[alias]
-                    cred = cfg.get("credential", cred_default_config(alias))
-                    cred_store(cred, new_sk)
-                    cfg["credential"] = cred
-                    models[alias] = cfg
-                    save_custom_models(models)
-                    _print_color(f"✔ {alias} 凭据已更新\n", color="\033[32m")
+                ep = cfg.get("endpoint", "")
+                print(f"{alias:<20} {mn:<25} {ep:<15} {backend:<22} {status:<10} {sk_preview}")
             _press_enter()
-            continue
 
         elif choice == "退出":
             break
