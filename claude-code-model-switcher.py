@@ -27,6 +27,7 @@ def _project_path(subpath: str) -> str:
 
 PROJECT_SETTINGS_PATH = _project_path("settings.json")
 LOCAL_SETTINGS_PATH = _project_path("settings.local.json")
+CCMS_SETTINGS_PATH = _project_path("ccms_settings.local.json")
 HELPER_SCRIPT_PATH = _project_path("get-sk.sh")
 
 # ============================================================
@@ -156,6 +157,99 @@ def select_from_list(items: list[str], title: str = "",
             continue
         _clear_lines(total_display)
         render()
+
+
+def select_from_tabs(tabs: list[tuple[str, list[str]]],
+                     common_items: list[str] | None = None,
+                     prompt: str = "← → 切换  ↑↓ 选择  Enter 确认  ESC 退出") -> str | None:
+    """Tab 式菜单。← → 切换 tab，↑↓ 在 tab 内选择。
+
+    tabs: [(标签名, [菜单项...]), ...] — 顺序即布局顺序
+    common_items: 所有 tab 共享的底部项
+    返回选中的菜单项字符串，ESC 返回 None"""
+    if not tabs:
+        return None
+    common = common_items or []
+    tab_idx = 0
+    item_idx = 0
+    n_tabs = len(tabs)
+
+    def _all_items():
+        """当前 tab 的 items + common_items（统一选择范围）"""
+        return tabs[tab_idx][1] + common
+
+    def _total_lines():
+        # tab header (1) + blank (1) + all items + prompt (1)
+        return 3 + len(_all_items())
+
+    last_lines = [0]
+
+    def render():
+        if last_lines[0] > 0:
+            _clear_lines(last_lines[0])
+        # Tab headers — 紧凑格式，避免换行
+        parts = []
+        for ti, (label, _) in enumerate(tabs):
+            marker = "\033[1m" if ti == tab_idx else "\033[2m"
+            parts.append(f"{marker}[{label}]\033[0m")
+        sys.stdout.write("  " + "  ".join(parts) + "\n")
+        print()
+        # Current tab items + common items（统一索引）
+        items = _all_items()
+        for i, item in enumerate(items):
+            prefix = "\033[7m > \033[0m" if i == item_idx else "   "
+            print(f"{prefix}{item}")
+        _print_color(f"{prompt}\n", dim=True)
+        last_lines[0] = _total_lines()
+
+    render()
+    while True:
+        ch = _getch()
+        if ch == "\xe0":
+            ch2 = _getch()
+            if ch2 == "H":   # ↑
+                item_idx = (item_idx - 1) % max(len(_all_items()), 1)
+            elif ch2 == "P": # ↓
+                item_idx = (item_idx + 1) % max(len(_all_items()), 1)
+            elif ch2 == "K": # ←
+                tab_idx = (tab_idx - 1) % n_tabs
+                item_idx = 0
+            elif ch2 == "M": # →
+                tab_idx = (tab_idx + 1) % n_tabs
+                item_idx = 0
+            else:
+                continue
+        elif ch == "\x1b":
+            ch2 = _getch()
+            if ch2 == "[":
+                ch3 = _getch()
+                if ch3 == "A":   # ↑
+                    item_idx = (item_idx - 1) % max(len(_all_items()), 1)
+                elif ch3 == "B": # ↓
+                    item_idx = (item_idx + 1) % max(len(_all_items()), 1)
+                elif ch3 == "C": # →
+                    tab_idx = (tab_idx + 1) % n_tabs
+                    item_idx = 0
+                elif ch3 == "D": # ←
+                    tab_idx = (tab_idx - 1) % n_tabs
+                    item_idx = 0
+                else:
+                    continue
+            elif ch2 == "\x1b":
+                _clear_lines(last_lines[0])
+                return None
+            else:
+                continue
+        elif ch in ("\r", "\n"):
+            _clear_lines(last_lines[0])
+            return _all_items()[item_idx]
+        elif ch == "\x03" or not ch:
+            _clear_lines(last_lines[0])
+            raise KeyboardInterrupt
+        else:
+            continue
+        render()
+
 
 def confirm(text: str, default_no: bool = False) -> bool:
     hint = "[y/N]" if default_no else "[Y/n]"
@@ -613,7 +707,7 @@ def load_custom_models() -> dict:
             save_custom_models(data)
         return data
     # 首次运行：从旧版 custom-models.json 导入（或直接使用已迁移的 v2 数据）
-    data = {"endpoints": {}, "routing": {}}
+    data = {"endpoints": {}}
     if os.path.isfile(LEGACY_MODELS_PATH):
         with open(LEGACY_MODELS_PATH, "r", encoding="utf-8") as f:
             raw = f.read()
@@ -622,9 +716,9 @@ def load_custom_models() -> dict:
         except json.JSONDecodeError:
             legacy = json.loads(_json_strip_trailing_commas(raw))
         if legacy:
-            if isinstance(legacy, dict) and "endpoints" in legacy and "routing" in legacy \
+            if isinstance(legacy, dict) and "endpoints" in legacy \
                     and "models" not in legacy:
-                data = legacy  # 已是新版 v2 格式（model 在 endpoint 内）
+                data = legacy  # 已是新版 v2 格式
             elif isinstance(legacy, dict) and "endpoints" in legacy and "models" in legacy:
                 # 旧版 v2 格式：model 在顶层，需迁移到 endpoint 内
                 data = _migrate_old_v2(legacy)
@@ -635,10 +729,10 @@ def load_custom_models() -> dict:
 
 
 def _migrate_old_v2(data: dict) -> dict:
-    """旧 v2 格式 → 新 v2 格式：顶层 models 迁移到 endpoint 内。
+    """旧 v2 格式 → 新 v2 格式：顶层 models 迁移到 endpoint 内，删除旧 routing。
 
-    旧: {endpoints: {ep: {url, credential}}, models: {alias: {endpoint, modelName}}, routing}
-    新: {endpoints: {ep: {url, credential, models: {alias: {modelName}}}}, routing}
+    旧: {endpoints: {ep: {url, credential}}, models: {alias: {...}}, routing}
+    新: {endpoints: {ep: {url, credential, models: {alias: {modelName}}, defaultRouting}}}
     """
     for alias, m in data.get("models", {}).items():
         ep_name = m.get("endpoint", "")
@@ -647,7 +741,15 @@ def _migrate_old_v2(data: dict) -> dict:
                 "modelName": m.get("modelName", alias)
             }
     data.pop("models", None)
+    data.pop("routing", None)
     data.pop("_version", None)
+    # 为每个 endpoint 设置 defaultRouting
+    for ep_name, ep in data.get("endpoints", {}).items():
+        if not ep.get("defaultRouting"):
+            ep_aliases = list(ep.get("models", {}).keys())
+            if ep_aliases:
+                first = ep_aliases[0]
+                ep["defaultRouting"] = {r: first for r, _ in _ROLE_LABELS}
     return data
 
 
@@ -656,7 +758,6 @@ def _import_legacy(legacy: dict) -> dict:
     endpoints = {}
     url_to_ep = {}
     ep_counter = 0
-    all_aliases = []
 
     for alias, cfg in sorted(legacy.items()):
         if not isinstance(cfg, dict):
@@ -682,20 +783,15 @@ def _import_legacy(legacy: dict) -> dict:
             endpoints[ep_name] = {"url": url, "credential": cred, "models": {}}
         ep_name = url_to_ep[ep_key]
         endpoints[ep_name]["models"][alias] = {"modelName": mn}
-        all_aliases.append(alias)
 
-    routing = {}
-    if all_aliases:
-        try:
-            s = load_merged_ccms_settings()
-            active = s.get("env", {}).get("CCMS_MODEL_ALIAS")
-            if not active or active not in all_aliases:
-                active = all_aliases[0]
-        except Exception:
-            active = all_aliases[0]
-        routing = {"opus": active, "sonnet": active, "haiku": active, "subagent": active}
+    # 为每个 endpoint 设置 defaultRouting
+    for ep_name, ep in endpoints.items():
+        ep_aliases = list(ep.get("models", {}).keys())
+        if ep_aliases:
+            first = ep_aliases[0]
+            ep["defaultRouting"] = {r: first for r, _ in _ROLE_LABELS}
 
-    return {"endpoints": endpoints, "routing": routing}
+    return {"endpoints": endpoints}
 
 def save_custom_models(models: dict):
     os.makedirs(os.path.dirname(MODELS_PATH), exist_ok=True)
@@ -739,6 +835,23 @@ def save_local_settings(settings: dict):
         json.dump(settings, f, indent=2, ensure_ascii=False)
         f.write("\n")
 
+def load_ccms_settings() -> dict:
+    """读取 .claude/ccms_settings.local.json（项目级 CCMS 快照）"""
+    if not os.path.isfile(CCMS_SETTINGS_PATH):
+        return {}
+    try:
+        with open(CCMS_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+def save_ccms_settings(data: dict):
+    """写入 .claude/ccms_settings.local.json"""
+    os.makedirs(os.path.dirname(CCMS_SETTINGS_PATH), exist_ok=True)
+    with open(CCMS_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
 def load_merged_ccms_settings() -> dict:
     """合并 project + local settings，local 覆盖 project。
 
@@ -757,7 +870,7 @@ def load_merged_ccms_settings() -> dict:
     return merged
 
 _CCMS_MANAGED_ENV_KEYS = (
-    "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL", "CCMS_MODEL_ALIAS",
+    "ANTHROPIC_BASE_URL", "ANTHROPIC_MODEL",  # 旧字段，迁移时清理
     "CLAUDE_CODE_SUBAGENT_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CCMS_ENDPOINT",
@@ -867,41 +980,40 @@ def _upsert_model(v2_data: dict, alias: str, url: str,
     if ep_name not in endpoints:
         endpoints[ep_name] = {"url": url, "credential": credential, "models": {}}
     endpoints[ep_name].setdefault("models", {})[alias] = {"modelName": model_name}
-    routing = v2_data.setdefault("routing", {})
-    if not routing:
-        routing.update({"opus": alias, "sonnet": alias,
-                        "haiku": alias, "subagent": alias})
+    # 首个模型自动设置 defaultRouting
+    ep = endpoints[ep_name]
+    if not ep.get("defaultRouting"):
+        ep["defaultRouting"] = {r: alias for r, _ in _ROLE_LABELS}
     return ep_name
 
 
 def _delete_model(v2_data: dict, alias: str) -> bool:
-    """从 endpoint 下删除模型并清理路由引用"""
+    """从 endpoint 下删除模型"""
     for ep in v2_data.get("endpoints", {}).values():
         if alias in ep.get("models", {}):
             del ep["models"][alias]
-            break
-    else:
-        return False
-    for role, a in list(v2_data.get("routing", {}).items()):
-        if a == alias:
-            del v2_data["routing"][role]
-    return True
+            # 清理 endpoint 的 defaultRouting 中引用该别名的项
+            dr = ep.get("defaultRouting", {})
+            for role, a in list(dr.items()):
+                if a == alias:
+                    if ep.get("models"):
+                        dr[role] = list(ep["models"].keys())[0]
+                    else:
+                        del dr[role]
+            return True
+    return False
 
 
 def get_current_alias(models: dict) -> str | None:
-    """返回当前项目设置的模型别名。"""
-    s = load_merged_ccms_settings()
-    env = s.get("env", {})
-    current_model = env.get("ANTHROPIC_MODEL", None)
-    if not current_model:
+    """返回当前项目设置的模型别名（从 ccms_settings.local.json 读取）。"""
+    ccms = load_ccms_settings()
+    if not ccms:
         return None
-    alias_tag = env.get("CCMS_MODEL_ALIAS", None)
-    if alias_tag and _find_model(models, alias_tag)[0]:
-        return alias_tag
-    for alias, cfg in _iter_models(models):
-        if cfg["modelName"] == current_model or alias == current_model:
-            return alias
-    return current_model
+    routing = ccms.get("routing", {})
+    sonnet = routing.get("sonnet", {})
+    if isinstance(sonnet, dict):
+        return sonnet.get("alias")
+    return sonnet or list(routing.values())[0] if routing else None
 
 # ============================================================
 # 模型配置兼容: 旧版 sk 字段 → 迁移到凭据后端
@@ -925,16 +1037,21 @@ _ROLE_ENV_MAP = [
 def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None):
     """写入项目 .claude/settings.local.json (env 不含 sk) 并生成 helper 脚本。
 
-    当 v2_data 提供时，按 routing 表写入 4 路独立 env var；
-    否则回退到旧版单模型模式（4 路指向同一模型）。"""
+    路由来源: endpoint 的 defaultRouting，fallback 为当前模型。
+    同时写入 ccms_settings.local.json 快照。"""
     settings = load_local_settings()
     if "env" not in settings:
         settings["env"] = {}
     env = settings["env"]
 
-    # 写 4 路路由 env var
-    if v2_data and v2_data.get("routing"):
-        routing = v2_data["routing"]
+    # 路由: endpoint defaultRouting → 当前模型
+    routing = None
+    if v2_data:
+        ep_name = _find_model(v2_data, alias)[0]
+        ep = v2_data.get("endpoints", {}).get(ep_name, {}) if ep_name else {}
+        routing = ep.get("defaultRouting")
+
+    if routing:
         for role, env_key in _ROLE_ENV_MAP:
             target_alias = routing.get(role)
             if target_alias and _find_model(v2_data, target_alias)[0]:
@@ -946,10 +1063,8 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None)
         for _, env_key in _ROLE_ENV_MAP:
             env[env_key] = mn
 
-    # 向后兼容字段 + 活跃 endpoint 标记
+    # 活跃 endpoint 标记
     env["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
-    env["ANTHROPIC_MODEL"] = model_config.get("modelName", alias)
-    env["CCMS_MODEL_ALIAS"] = alias
     if v2_data:
         env["CCMS_ENDPOINT"] = _active_endpoint(v2_data) or ""
 
@@ -960,6 +1075,20 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None)
     save_local_settings(settings)
     _generate_helper_scripts()
     _migrate_ccms_fields_from_project()
+
+    # 写入 ccms_settings.local.json 快照
+    if v2_data and routing:
+        ep_name = _find_model(v2_data, alias)[0]
+        snapshot = {"endpoint": ep_name or "", "routing": {}}
+        for role, _ in _ROLE_ENV_MAP:
+            target_alias = routing.get(role)
+            if target_alias:
+                target_cfg = _model_flat_config(v2_data, target_alias)
+                snapshot["routing"][role] = {
+                    "alias": target_alias,
+                    "modelName": target_cfg.get("modelName", target_alias)
+                }
+        save_ccms_settings(snapshot)
 
 def _generate_helper_scripts():
     """生成 helper 脚本（.sh + .ps1），委托给 Python 取凭据"""
@@ -977,19 +1106,9 @@ def _generate_helper_scripts():
     script_ps1 = script_path.replace("\\", "/")
     ps1 = textwrap.dedent(f"""\
     # Claude Code apiKeyHelper — 由 claude-code-model-switcher.py 自动维护
-    param($ModelArg)
-    $root = "{root_ps1}"
     $script = "{script_ps1}"
     $py = "{py}"
-    if (-not $ModelArg) {{
-        $ModelArg = & $py -c "
-    import json
-    s = json.load(open('$root/.claude/settings.local.json'))
-    print(s.get('env', {{}}).get('ANTHROPIC_MODEL', ''))
-    " 2>$null
-    }}
-    if (-not $ModelArg) {{ exit 1 }}
-    $sk = & $py "$script" --get-sk $ModelArg 2>$null
+    $sk = & $py "$script" --get-sk 2>$null
     Write-Output $sk
     """)
     with open(os.path.join(helper_dir, "get-sk.ps1"), "w", encoding="utf-8") as f:
@@ -1014,7 +1133,6 @@ def _generate_helper_scripts():
     #!/bin/bash
     # Claude Code apiKeyHelper — 由 claude-code-model-switcher.py 自动维护
     set -euo pipefail
-    SELF_DIR="{root_nix}"
     SCRIPT="{script_nix}"
     _PY=""
     for _p in "{py_nix}" python3 python; do
@@ -1024,16 +1142,7 @@ def _generate_helper_scripts():
         fi
     done
     [ -z "$_PY" ] && exit 1
-    MODEL="${{1:-}}"
-    if [ -z "$MODEL" ]; then
-        MODEL=$("$_PY" -c "
-    import json
-    s = json.load(open('$SELF_DIR/.claude/settings.local.json'))
-    print(s.get('env', {{}}).get('ANTHROPIC_MODEL', ''))
-    " 2>/dev/null || echo "")
-    fi
-    [ -z "$MODEL" ] && exit 1
-    exec "$_PY" "$SCRIPT" --get-sk "$MODEL"
+    exec "$_PY" "$SCRIPT" --get-sk
     """)
     with open(os.path.join(helper_dir, "get-sk.sh"), "w", encoding="utf-8", newline="\n") as f:
         f.write(sh)
@@ -1086,25 +1195,23 @@ def cmd_env(args: list[str]):
         sys.exit(1)
 
 def cmd_get_sk(args: list[str]):
-    """--get-sk 模式: 输出原始 sk（供 apiKeyHelper 调用）"""
+    """--get-sk 模式: 从 ccms_settings.local.json 查 endpoint → credential → 输出 sk"""
+    ccms = load_ccms_settings()
+    ep_name = ccms.get("endpoint", "") if ccms else ""
+    if not ep_name:
+        print("错误: ccms_settings.local.json 中未配置 endpoint", file=sys.stderr)
+        sys.exit(1)
     models = load_custom_models()
-
-    target = args[0] if args else get_current_alias(models)
-    if target:
-        result = resolve_model(target, models)
-        if result:
-            _alias, cfg = result
-            sk = _get_sk(_alias, cfg)
-            if sk:
-                sys.stdout.write(sk)
-                return
-            print("错误: 模型凭据不可用", file=sys.stderr)
-            sys.exit(1)
-        else:
-            print(f"错误: 模型 \"{target}\" 不存在", file=sys.stderr)
-            sys.exit(1)
+    ep = models.get("endpoints", {}).get(ep_name, {})
+    cred = ep.get("credential", {})
+    if not cred:
+        print(f"错误: endpoint \"{ep_name}\" 无凭据配置", file=sys.stderr)
+        sys.exit(1)
+    sk = cred_retrieve(cred)
+    if sk:
+        sys.stdout.write(sk)
     else:
-        print("错误: 未指定模型", file=sys.stderr)
+        print("错误: 凭据不可用", file=sys.stderr)
         sys.exit(1)
 
 def cmd_reveal():
@@ -1129,21 +1236,20 @@ def cmd_reveal():
         sk_preview = (sk[:8] + "...") if sk else "-"
         ep = cfg.get("endpoint", "")
         print(f"{alias:<20} {mn:<25} {ep:<15} {backend:<20} {status:<10} {sk_preview}")
-    # 路由表
-    routing = models.get("routing", {})
-    if routing:
-        print(f"\n{'':-^105}")
-        _print_color("路由配置 (Routing)\n", bold=True)
-        print(f"  {'角色':<12} {'别名':<20} {'modelName':<28} {'endpoint':<15}")
-        print(f"  {'-'*75}")
-        for role in ("opus", "sonnet", "haiku", "subagent"):
-            alias = routing.get(role, "（未设置）")
-            cfg = _model_flat_config(models, alias)
-            mn = cfg.get("modelName", alias)
-            ep = cfg.get("endpoint", "")
-            print(f"  {role:<12} {alias:<20} {mn:<28} {ep:<15}")
-    else:
-        _print_color("\n（未配置路由映射）\n", color="\033[33m")
+    # 各 endpoint 的默认路由
+    print(f"\n{'':-^105}")
+    _print_color("Endpoint 默认路由\n", bold=True)
+    for ep_name, ep in models.get("endpoints", {}).items():
+        dr = ep.get("defaultRouting", {})
+        if dr:
+            print(f"  [{ep_name}]")
+            for role in ("opus", "sonnet", "haiku", "subagent"):
+                alias = dr.get(role, "—")
+                cfg = _model_flat_config(models, alias) if alias != "—" else {}
+                mn = cfg.get("modelName", alias)
+                print(f"    {role:<10} → {alias:<20} ({mn})")
+        else:
+            print(f"  [{ep_name}] （无默认路由）")
     print()
     if confirm("导出全部 sk 到 stdout（JSON 格式，用于迁移）？", default_no=True):
         out = {}
@@ -1204,6 +1310,88 @@ def detect_env_api_key_conflict():
     if us.get("env", {}).get("ANTHROPIC_API_KEY"):
         conflicts.append(("用户 (user)", os.path.expanduser("~/.claude/settings.json")))
     return conflicts
+
+
+def check_ccms_consistency() -> list[tuple[str, str, str]]:
+    """比对 ccms_settings.local.json 快照与 settings.local.json 的一致性。
+
+    返回 [(字段名, ccms值, settings值), ...] 差异列表。空列表表示一致。"""
+    ccms = load_ccms_settings()
+    if not ccms:
+        return []
+    local = load_local_settings()
+    local_env = local.get("env", {})
+
+    diffs = []
+    # 比对基础字段
+    ccms_ep = ccms.get("endpoint", "")
+    if ccms_ep and ccms_ep != local_env.get("CCMS_ENDPOINT", ""):
+        diffs.append(("CCMS_ENDPOINT", ccms_ep, local_env.get("CCMS_ENDPOINT", "")))
+
+    # 比对 4 路路由
+    ccms_routing = ccms.get("routing", {})
+    for role, env_key in _ROLE_ENV_MAP:
+        ccms_entry = ccms_routing.get(role, {})
+        ccms_mn = ccms_entry.get("modelName", "") if isinstance(ccms_entry, dict) else ""
+        local_mn = local_env.get(env_key, "")
+        if ccms_mn and ccms_mn != local_mn:
+            diffs.append((env_key, ccms_mn, local_mn))
+
+    # 比对 ANTHROPIC_MODEL / ANTHROPIC_BASE_URL
+    sonnet_entry = ccms_routing.get("sonnet", {})
+    if isinstance(sonnet_entry, dict) and sonnet_entry.get("modelName"):
+        ccms_model = sonnet_entry["modelName"]
+        if ccms_model != local_env.get("ANTHROPIC_MODEL", ""):
+            diffs.append(("ANTHROPIC_MODEL", ccms_model, local_env.get("ANTHROPIC_MODEL", "")))
+
+    return diffs
+
+
+def _prompt_ccms_sync(diffs: list[tuple[str, str, str]]):
+    """显示一致性差异并询问用户处理方式。"""
+    if not diffs:
+        return
+    _print_color("\n⚠  项目 CCMS 配置与 settings.local.json 不一致\n", color="\033[33m")
+    print(f"  {'字段':<35} {'ccms_settings':<25} {'settings.local':<25}")
+    print(f"  {'-'*85}")
+    for field, ccms_val, local_val in diffs:
+        print(f"  {field:<35} {ccms_val:<25} {local_val:<25}")
+    print()
+
+    options = ["以 ccms_settings 为准，覆盖 settings.local",
+               "以 settings.local 为准，更新 ccms_settings",
+               "忽略"]
+    sel = select_from_list(options, title="选择同步方向")
+    if sel == 0:
+        # ccms → settings.local
+        local = load_local_settings()
+        local_env = local.setdefault("env", {})
+        ccms = load_ccms_settings()
+        ccms_routing = ccms.get("routing", {})
+        for field, ccms_val, _ in diffs:
+            local_env[field] = ccms_val
+        # 也同步路由 env var
+        for role, env_key in _ROLE_ENV_MAP:
+            entry = ccms_routing.get(role, {})
+            if isinstance(entry, dict) and entry.get("modelName"):
+                local_env[env_key] = entry["modelName"]
+        save_local_settings(local)
+        _print_color("✔ 已用 ccms_settings 覆盖 settings.local.json\n", color="\033[32m")
+    elif sel == 1:
+        # settings.local → ccms
+        local = load_local_settings()
+        local_env = local.get("env", {})
+        ccms = load_ccms_settings()
+        ccms["endpoint"] = local_env.get("CCMS_ENDPOINT", ccms.get("endpoint", ""))
+        ccms_routing = ccms.setdefault("routing", {})
+        for role, env_key in _ROLE_ENV_MAP:
+            mn = local_env.get(env_key, "")
+            if mn:
+                if role not in ccms_routing or not isinstance(ccms_routing[role], dict):
+                    ccms_routing[role] = {}
+                ccms_routing[role]["modelName"] = mn
+        save_ccms_settings(ccms)
+        _print_color("✔ 已用 settings.local 更新 ccms_settings\n", color="\033[32m")
 
 
 def _is_secret_service_locked() -> bool:
@@ -1352,7 +1540,7 @@ def _check_high_priority_env_vars() -> list[tuple[str, str]]:
 
 
 def _ensure_gitignore():
-    """确保 .gitignore 包含 .claude/settings.local.json。
+    """确保 .gitignore 包含 .claude/settings.local.json 和 ccms_settings.local.json。
 
     检测当前目录是否为 git 仓库，如果是则检查 .gitignore
     是否已忽略 settings.local.json，若否自动追加。"""
@@ -1365,7 +1553,7 @@ def _ensure_gitignore():
     except Exception:
         return
     gitignore_path = os.path.join(os.getcwd(), ".gitignore")
-    patterns = (".claude/settings.local.json\n", ".claude/\n", ".claude\n")
+    patterns = (".claude/settings.local.json\n", ".claude/ccms_settings.local.json\n", ".claude/\n", ".claude\n")
     if os.path.isfile(gitignore_path):
         with open(gitignore_path, "r", encoding="utf-8") as f:
             content = f.read()
@@ -1376,13 +1564,15 @@ def _ensure_gitignore():
     else:
         content = ""
     # 追加忽略规则
-    line = ".claude/settings.local.json\n"
+    lines_to_add = [".claude/settings.local.json\n", ".claude/ccms_settings.local.json\n"]
     if content and not content.endswith("\n"):
         content += "\n"
-    content += line
+    for line in lines_to_add:
+        if line.rstrip("\n") not in content:
+            content += line
     with open(gitignore_path, "w", encoding="utf-8") as f:
         f.write(content)
-    _print_color(f"✔ 已将 {line.strip()} 追加到 .gitignore\n", color="\033[32m")
+    _print_color("✔ 已将 .claude/ 配置文件追加到 .gitignore\n", color="\033[32m")
 
 # ============================================================
 # 环境信息显示
@@ -1416,7 +1606,12 @@ def get_env_info_lines() -> list[tuple[str, str]]:
 
     # ── 当前项目 (.claude/) ──
     lines.append(("项目路径", os.getcwd(), ""))
-    lines.append(("配置文件", "settings.local.json (local) + settings.json (project)", ""))
+    lines.append(("配置文件", "settings.local.json + ccms_settings.local.json + settings.json", ""))
+
+    # ccms_settings 一致性
+    ccms_diffs = check_ccms_consistency()
+    if ccms_diffs:
+        lines.append(("⚠ 配置不一致", f"ccms_settings 与 settings.local 有 {len(ccms_diffs)} 处差异", "yellow"))
 
     # apiKeyHelper 状态
     helper_dir = os.path.dirname(HELPER_SCRIPT_PATH)
@@ -1565,23 +1760,21 @@ def _endpoint_menu(v2_data: dict):
 # ============================================================
 
 def _active_endpoint(models: dict) -> str | None:
-    """返回当前活跃的 endpoint 名。优先读 CCMS_ENDPOINT，fallback URL 匹配。"""
+    """返回当前活跃的 endpoint 名。优先读 CCMS_ENDPOINT，fallback ccms_settings / URL 匹配。"""
     s = load_merged_ccms_settings()
     ep_tag = s.get("env", {}).get("CCMS_ENDPOINT", "")
     if ep_tag and ep_tag in models.get("endpoints", {}):
         return ep_tag
+    # fallback: ccms_settings.local.json
+    ccms = load_ccms_settings()
+    ccms_ep = ccms.get("endpoint", "") if ccms else ""
+    if ccms_ep and ccms_ep in models.get("endpoints", {}):
+        return ccms_ep
     # fallback: URL 匹配（旧项目无 CCMS_ENDPOINT）
     base_url = s.get("env", {}).get("ANTHROPIC_BASE_URL", "")
     if base_url:
         for ep_name, ep in models.get("endpoints", {}).items():
             if ep.get("url", "") == base_url:
-                return ep_name
-    routing = models.get("routing", {})
-    for role in ("sonnet", "opus", "haiku", "subagent"):
-        alias = routing.get(role)
-        if alias:
-            ep_name, _ = _find_model(models, alias)
-            if ep_name:
                 return ep_name
     eps = list(models.get("endpoints", {}).keys())
     return eps[0] if eps else None
@@ -1591,14 +1784,32 @@ _ROLE_LABELS = [("opus", "Opus"), ("sonnet", "Sonnet"),
                 ("haiku", "Haiku"), ("subagent", "Subagent")]
 
 
-def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str]):
-    """交互式路由编辑：↑↓ 选角色，← → 切模型，Enter 确认。"""
+def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str],
+                    scope: str = "project"):
+    """交互式路由编辑：↑↓ 选角色，← → 切模型，Enter 确认。
+
+    scope:
+      "endpoint" — 编辑 endpoint 的 defaultRouting（全局 ccms-endpoints.json）
+      "project"  — 编辑当前项目路由（settings.local.json + ccms_settings.local.json）"""
     if not model_aliases:
         _print_color("当前 endpoint 下无可用模型\n", color="\033[33m")
         _press_enter()
         return
 
-    routing = v2_data.setdefault("routing", {})
+    # 根据 scope 决定读取来源
+    ep = v2_data.get("endpoints", {}).get(active_ep, {})
+    if scope == "endpoint":
+        routing = dict(ep.get("defaultRouting", {}))
+        title_suffix = "endpoint 默认路由"
+    else:
+        # 从 ccms_settings.local.json 读取项目路由
+        ccms_local = load_ccms_settings()
+        project_raw = ccms_local.get("routing", {}) if ccms_local else {}
+        routing = {}
+        for role, entry in project_raw.items():
+            routing[role] = entry.get("alias", entry) if isinstance(entry, dict) else entry
+        title_suffix = "当前项目路由"
+
     # 每个角色当前选的 model index（-1 = 清空）
     options = model_aliases + ["（清空）"]
     selected_role = 0
@@ -1617,7 +1828,7 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str]):
             first[0] = False
         else:
             _clear_lines(total_lines)
-        _print_color(f"修改路由 ({active_ep} 下的模型)\n", bold=True)
+        _print_color(f"编辑{title_suffix} ({active_ep} 下的模型)\n", bold=True)
         _print_color("↑↓ 选角色  ← → 切模型  Enter 确认  ESC 放弃\n", dim=True)
         for i, (role_key, role_label) in enumerate(_ROLE_LABELS):
             mi = model_indices[i]
@@ -1672,17 +1883,24 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str]):
 
     # 应用变更
     _clear_lines(total_lines)
+    new_routing = {}
     for i, (role_key, _) in enumerate(_ROLE_LABELS):
         mi = model_indices[i]
-        if mi == len(options) - 1:
-            routing.pop(role_key, None)
-        else:
-            routing[role_key] = model_aliases[mi]
-    save_custom_models(v2_data)
-    if routing:
-        rep = routing.get("sonnet") or list(routing.values())[0]
-        write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data)
-    _print_color("✔ 路由已更新\n", color="\033[32m")
+        if mi != len(options) - 1:
+            new_routing[role_key] = model_aliases[mi]
+
+    if scope == "endpoint":
+        # 写入 endpoint 的 defaultRouting（全局）
+        if ep:
+            ep["defaultRouting"] = new_routing
+        save_custom_models(v2_data)
+        _print_color("✔ endpoint 默认路由已更新\n", color="\033[32m")
+    else:
+        # 写入项目级：settings.local.json + ccms_settings.local.json
+        if new_routing:
+            rep = new_routing.get("sonnet") or list(new_routing.values())[0]
+            write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data)
+        _print_color("✔ 当前项目路由已更新\n", color="\033[32m")
     _press_enter()
 
 
@@ -1690,6 +1908,11 @@ def main():
     _setup_console()
     models = load_custom_models()
     _ensure_gitignore()
+
+    # 启动时一致性检查
+    diffs = check_ccms_consistency()
+    if diffs:
+        _prompt_ccms_sync(diffs)
 
     while True:
         print("\033[2J\033[H", end="")
@@ -1703,7 +1926,17 @@ def main():
         print()
 
         endpoints = models.get("endpoints", {})
-        routing = models.get("routing", {})
+        # 项目级路由优先，fallback 到全局路由
+        ccms_local = load_ccms_settings()
+        ccms_routing_raw = ccms_local.get("routing", {})
+        # ccms_routing 格式: {role: {alias, modelName}}，提取 alias
+        project_routing = {}
+        for role, entry in ccms_routing_raw.items():
+            if isinstance(entry, dict):
+                project_routing[role] = entry.get("alias", "")
+            else:
+                project_routing[role] = entry
+        routing = project_routing
         active_ep = _active_endpoint(models)
 
         # ── 活跃 Endpoint ──
@@ -1743,23 +1976,31 @@ def main():
             _print_color("  " + "─" * 40 + "\n", dim=True)
 
             # ── 菜单 ──
-            menu_items = ["切换 Endpoint", "添加模型"]
-            if model_aliases:
-                menu_items.append("删除模型")
-            menu_items.append("修改路由")
-            menu_items.append("修改凭据")
-            menu_items.append("管理 Endpoints")
-            menu_items.append("查看所有凭据")
-            menu_items.append("退出")
+            _TABS = [
+                ("Endpoint 管理", [
+                    "切换 Endpoint",
+                    "管理 Endpoints",
+                    "修改凭据",
+                ]),
+                ("路由管理", [
+                    "编辑 endpoint 默认路由",
+                    "编辑当前项目路由",
+                ]),
+                ("模型管理", [
+                    "添加模型",
+                    "删除模型",
+                ]),
+            ]
+            _COMMON = ["查看所有凭据", "退出"]
+            choice = select_from_tabs(_TABS, _COMMON)
         else:
             _print_color("  暂无可用 Endpoint\n", color="\033[33m")
-            menu_items = ["创建 Endpoint", "退出"]
+            choice = select_from_list(["创建 Endpoint", "退出"], prompt="↑↓ 选择 Enter 确认  ESC 退出")
+            if choice is not None:
+                choice = ["创建 Endpoint", "退出"][choice]
 
-        idx = select_from_list(menu_items, prompt="↑↓ 选择 Enter 确认  ESC 退出")
-        if idx is None:
+        if choice is None:
             break
-
-        choice = menu_items[idx]
         ep_models = endpoints.get(active_ep, {}).get("models", {}) if active_ep else {}
         model_aliases = list(ep_models.keys())
 
@@ -1769,20 +2010,26 @@ def main():
             sel = select_from_list(ep_names, title="选择 Endpoint")
             if sel is not None:
                 ep_name = ep_names[sel]
-                ep_models_sel = endpoints[ep_name].get("models", {})
+                ep_cfg = endpoints[ep_name]
+                ep_models_sel = ep_cfg.get("models", {})
                 aliases_sel = list(ep_models_sel.keys())
-                # 重置 routing 为该 endpoint 的模型
-                if aliases_sel:
+                # 使用 endpoint 的 defaultRouting 覆盖项目路由
+                dr = ep_cfg.get("defaultRouting", {})
+                if dr:
+                    routing_to_apply = dict(dr)
+                elif aliases_sel:
                     first = aliases_sel[0]
-                    models["routing"] = {r: first for r, _ in _ROLE_LABELS}
+                    routing_to_apply = {r: first for r, _ in _ROLE_LABELS}
+                else:
+                    routing_to_apply = {}
                 # 先写 CCMS_ENDPOINT 再调 write_model_to_project
                 settings = load_local_settings()
                 settings.setdefault("env", {})["CCMS_ENDPOINT"] = ep_name
                 save_local_settings(settings)
-                cfg = _model_flat_config(models, aliases_sel[0]) if aliases_sel else {"url": endpoints[ep_name].get("url", ""), "modelName": "", "credential": {}}
-                write_model_to_project(aliases_sel[0] if aliases_sel else "none", cfg, models)
-                save_custom_models(models)
-                _print_color(f"✔ 已切换至 {ep_name}，路由已重置\n", color="\033[32m")
+                rep = routing_to_apply.get("sonnet") or (aliases_sel[0] if aliases_sel else "none")
+                cfg = _model_flat_config(models, rep) if aliases_sel else {"url": ep_cfg.get("url", ""), "modelName": "", "credential": {}}
+                write_model_to_project(rep, cfg, models)
+                _print_color(f"✔ 已切换至 {ep_name}，路由已应用\n", color="\033[32m")
                 _press_enter()
 
         # ---- 添加模型 (在当前 endpoint 下) ----
@@ -1797,12 +2044,6 @@ def main():
             ep = endpoints[active_ep]
             _upsert_model(models, alias, ep["url"], mn, ep.get("credential", {}))
             save_custom_models(models)
-            # 如果路由为空，自动路由到新模型
-            if not models.get("routing"):
-                models["routing"] = {r: alias for r, _ in _ROLE_LABELS}
-                cfg = _model_flat_config(models, alias)
-                write_model_to_project(alias, cfg, models)
-                save_custom_models(models)
             _print_color(f"✔ 已添加: {alias} → {mn}\n", color="\033[32m")
             _press_enter()
 
@@ -1814,18 +2055,17 @@ def main():
                 if confirm(f"确定删除 \"{alias}\" 吗？", default_no=True):
                     _delete_model(models, alias)
                     save_custom_models(models)
-                    if models.get("routing"):
-                        rep = models["routing"].get("sonnet") or _model_aliases(models)[0]
-                        write_model_to_project(rep, _model_flat_config(models, rep), models)
                     _print_color(f"✔ 已删除\n", color="\033[32m")
             _press_enter()
 
-        # ---- 修改路由 ----
-        elif choice == "修改路由":
-            _routing_picker(models, active_ep, model_aliases)
-            # 重载（routing 可能已变更）
-            routing = models.get("routing", {})
+        # ---- 编辑 endpoint 默认路由 ----
+        elif choice == "编辑 endpoint 默认路由":
+            _routing_picker(models, active_ep, model_aliases, scope="endpoint")
 
+        # ---- 编辑当前项目路由 ----
+        elif choice == "编辑当前项目路由":
+            _routing_picker(models, active_ep, model_aliases, scope="project")
+            # 重载（routing 可能已变更）
         # ---- 修改凭据 ----
         elif choice == "修改凭据":
             _print_color(f"\n修改 {active_ep} 的 API Key\n", bold=True)

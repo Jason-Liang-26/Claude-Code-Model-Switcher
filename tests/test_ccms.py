@@ -290,7 +290,7 @@ class TestLoadSaveCustomModels(unittest.TestCase):
     def test_load_missing_file(self):
         self.assertFalse(self.models_path.exists())
         self.assertEqual(ccms.load_custom_models(),
-                         {"endpoints": {}, "routing": {}})
+                         {"endpoints": {}})
 
     def test_roundtrip(self):
         data = {"endpoints": {"ep1": {"url": "https://example.com", "credential": {},
@@ -462,7 +462,6 @@ class TestMigrateProjectSettings(unittest.TestCase):
             "env": {
                 "ANTHROPIC_BASE_URL": "https://api.example.com",
                 "ANTHROPIC_MODEL": "claude-3",
-                "CCMS_MODEL_ALIAS": "my-model",
                 "CLAUDE_CODE_SUBAGENT_MODEL": "sub-model",
                 "USER_VAR": "keep-me"
             },
@@ -473,7 +472,6 @@ class TestMigrateProjectSettings(unittest.TestCase):
         remaining = json.loads(self.project_path.read_text())
         self.assertNotIn("ANTHROPIC_BASE_URL", remaining.get("env", {}))
         self.assertNotIn("ANTHROPIC_MODEL", remaining.get("env", {}))
-        self.assertNotIn("CCMS_MODEL_ALIAS", remaining.get("env", {}))
         self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", remaining.get("env", {}))
         self.assertNotIn("apiKeyHelper", remaining)
         self.assertEqual(remaining.get("env", {}).get("USER_VAR"), "keep-me")
@@ -481,7 +479,7 @@ class TestMigrateProjectSettings(unittest.TestCase):
 
     def test_removes_empty_file(self):
         self.project_path.write_text(json.dumps({
-            "env": {"CCMS_MODEL_ALIAS": "m"},
+            "env": {"ANTHROPIC_MODEL": "m"},
             "apiKeyHelper": "echo"
         }))
         ccms._migrate_ccms_fields_from_project()
@@ -530,13 +528,13 @@ class TestHelperScriptReference(unittest.TestCase):
         ccms._generate_helper_scripts()
         ps1_path = self.helper_path.parent / "get-sk.ps1"
         content = ps1_path.read_text(encoding="utf-8")
-        self.assertIn("settings.local.json", content)
+        self.assertIn("--get-sk", content)
 
     def test_sh_references_settings_local_json(self):
         ccms._generate_helper_scripts()
         sh_path = self.helper_path.parent / "get-sk.sh"
         content = sh_path.read_text(encoding="utf-8")
-        self.assertIn("settings.local.json", content)
+        self.assertIn("--get-sk", content)
 
 
 class TestDetectEnvApiKeyConflict(unittest.TestCase):
@@ -624,7 +622,7 @@ class TestImportLegacy(unittest.TestCase):
         ep_name = list(result["endpoints"].keys())[0]
         self.assertIn("my-model", result["endpoints"][ep_name]["models"])
         self.assertEqual(result["endpoints"][ep_name]["models"]["my-model"]["modelName"], "test-model")
-        self.assertEqual(result["routing"]["opus"], "my-model")
+        self.assertEqual(result["endpoints"][ep_name]["defaultRouting"]["opus"], "my-model")
 
     @mock.patch("ccms.load_merged_ccms_settings", return_value={})
     def test_same_url_deduplication(self, _mock_settings):
@@ -647,21 +645,19 @@ class TestImportLegacy(unittest.TestCase):
         result = ccms._import_legacy(v1)
         self.assertEqual(len(result["endpoints"]), 2)
 
-    @mock.patch("ccms.load_merged_ccms_settings")
-    def test_uses_active_alias_from_settings(self, mock_settings):
-        mock_settings.return_value = {"env": {"CCMS_MODEL_ALIAS": "m2"}}
+    def test_uses_active_alias_from_settings(self):
         v1 = {
             "m1": {"url": "https://api.example.com/v1", "modelName": "model-1"},
             "m2": {"url": "https://api.example.com/v1", "modelName": "model-2"},
         }
         result = ccms._import_legacy(v1)
-        self.assertEqual(result["routing"]["opus"], "m2")
+        ep_name = list(result["endpoints"].keys())[0]
+        self.assertEqual(result["endpoints"][ep_name]["defaultRouting"]["opus"], "m1")
 
     @mock.patch("ccms.load_merged_ccms_settings", return_value={})
     def test_empty_v1(self, _mock_settings):
         result = ccms._import_legacy({})
         self.assertEqual(result["endpoints"], {})
-        self.assertEqual(result["routing"], {})
 
     @mock.patch("ccms.load_merged_ccms_settings", return_value={})
     @mock.patch("ccms.cred_store")
@@ -709,17 +705,16 @@ class TestAccessors(unittest.TestCase):
         v2 = self._empty_v2()
         ccms._upsert_model(v2, "m1", "https://api.example.com/v1", "test-model",
                           {"type": "wincred"})
-        self.assertEqual(v2["routing"]["opus"], "m1")
+        self.assertEqual(v2["endpoints"]["example"]["defaultRouting"]["opus"], "m1")
 
     def test_delete_model(self):
         v2 = {
             "endpoints": {"ep1": {"url": "https://x.com", "credential": {},
-                                   "models": {"m1": {"modelName": "m1"}}}},
-            "routing": {"opus": "m1", "sonnet": "m1"},
+                                   "models": {"m1": {"modelName": "m1"}},
+                                   "defaultRouting": {"opus": "m1", "sonnet": "m1"}}},
         }
         self.assertTrue(ccms._delete_model(v2, "m1"))
         self.assertNotIn("m1", v2["endpoints"]["ep1"]["models"])
-        self.assertNotIn("opus", v2["routing"])
 
     def test_delete_model_not_found(self):
         v2 = self._empty_v2()
@@ -734,9 +729,11 @@ class TestWriteModelToProject(unittest.TestCase):
         self.local_path = Path(self.tmpdir.name) / "settings.local.json"
         self.project_path = Path(self.tmpdir.name) / "settings.json"
         self.helper_dir = Path(self.tmpdir.name)
+        ccms_path = Path(self.tmpdir.name) / "ccms_settings.local.json"
         self.patches = [
             mock.patch("ccms.LOCAL_SETTINGS_PATH", str(self.local_path)),
             mock.patch("ccms.PROJECT_SETTINGS_PATH", str(self.project_path)),
+            mock.patch("ccms.CCMS_SETTINGS_PATH", str(ccms_path)),
             mock.patch("ccms.HELPER_SCRIPT_PATH", str(self.helper_dir / "get-sk.sh")),
             mock.patch("ccms._detect_platform", return_value="windows"),
         ]
@@ -749,16 +746,15 @@ class TestWriteModelToProject(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def _make_v2(self, routing=None):
-        v2 = {
-            "endpoints": {"ep1": {"url": "https://api.example.com/v1",
-                                   "credential": {"type": "wincred"},
-                                   "models": {
-                                       "m1": {"modelName": "model-one"},
-                                       "m2": {"modelName": "model-two"},
-                                   }}},
-            "routing": routing or {},
-        }
-        return v2
+        ep = {"url": "https://api.example.com/v1",
+              "credential": {"type": "wincred"},
+              "models": {
+                  "m1": {"modelName": "model-one"},
+                  "m2": {"modelName": "model-two"},
+              }}
+        if routing:
+            ep["defaultRouting"] = routing
+        return {"endpoints": {"ep1": ep}}
 
     def test_writes_four_role_env_vars(self):
         v2 = self._make_v2({"opus": "m1", "sonnet": "m2", "haiku": "m1", "subagent": "m2"})
@@ -781,9 +777,8 @@ class TestWriteModelToProject(unittest.TestCase):
         with open(self.local_path) as f:
             written = json.load(f)
         env = written["env"]
-        self.assertEqual(env["ANTHROPIC_MODEL"], "model-one")
         self.assertEqual(env["ANTHROPIC_BASE_URL"], "https://api.example.com/v1")
-        self.assertEqual(env["CCMS_MODEL_ALIAS"], "m1")
+        self.assertEqual(env["CCMS_ENDPOINT"], "ep1")
 
     def test_no_routing_fallback_all_same(self):
         """无路由表时 4 路全部指向当前模型"""
@@ -805,11 +800,14 @@ class TestGetCurrentAliasV2(unittest.TestCase):
 
     def setUp(self):
         self.tmpdir = tempfile.TemporaryDirectory()
+        td = str(Path(self.tmpdir.name))
         self.patches = [
             mock.patch("ccms.PROJECT_SETTINGS_PATH",
-                       str(Path(self.tmpdir.name) / "settings.json")),
+                       f"{td}/settings.json"),
             mock.patch("ccms.LOCAL_SETTINGS_PATH",
-                       str(Path(self.tmpdir.name) / "settings.local.json")),
+                       f"{td}/settings.local.json"),
+            mock.patch("ccms.CCMS_SETTINGS_PATH",
+                       f"{td}/ccms_settings.local.json"),
         ]
         for p in self.patches:
             p.start()
@@ -820,7 +818,8 @@ class TestGetCurrentAliasV2(unittest.TestCase):
         self.tmpdir.cleanup()
 
     def test_finds_alias_by_tag(self):
-        ccms.save_local_settings({"env": {"ANTHROPIC_MODEL": "model-one", "CCMS_MODEL_ALIAS": "m1"}})
+        ccms.save_ccms_settings({"endpoint": "ep1", "routing": {
+            "sonnet": {"alias": "m1", "modelName": "model-one"}}})
         v2 = {
             "endpoints": {"ep1": {"url": "https://x.com", "credential": {},
                                    "models": {"m1": {"modelName": "model-one"}}}},
@@ -833,7 +832,8 @@ class TestGetCurrentAliasV2(unittest.TestCase):
         self.assertIsNone(ccms.get_current_alias(v2))
 
     def test_fallback_by_modelname_reverse_lookup(self):
-        ccms.save_local_settings({"env": {"ANTHROPIC_MODEL": "model-two"}})
+        ccms.save_ccms_settings({"endpoint": "ep1", "routing": {
+            "sonnet": {"alias": "m2", "modelName": "model-two"}}})
         v2 = {
             "endpoints": {"ep1": {"url": "https://x.com", "credential": {},
                                    "models": {
