@@ -1,0 +1,21 @@
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.2.22",
+  "base_commit_sha": "96c980afcb6b606a71d763b23d30a65bc8661cd4",
+  "prompts": {
+    "3fb92a6e12720f7d": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "78987a89-5669-45a7-b664-e8866c7ce701",
+        "model": "mimo-v2.5-pro"
+      },
+      "human_author": "liangjc1",
+      "messages": [],
+      "total_additions": 2209,
+      "total_deletions": 2172,
+      "accepted_lines": 0,
+      "overriden_lines": 0
+    }
+  }
+}
