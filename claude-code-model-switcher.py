@@ -1539,40 +1539,71 @@ def _check_high_priority_env_vars() -> list[tuple[str, str]]:
     return warnings
 
 
-def _ensure_gitignore():
-    """确保 .gitignore 包含 .claude/settings.local.json 和 ccms_settings.local.json。
-
-    检测当前目录是否为 git 仓库，如果是则检查 .gitignore
-    是否已忽略 settings.local.json，若否自动追加。"""
+def _get_global_gitignore_path():
+    """获取全局 gitignore 文件路径（从 core.excludesfile 读取）。"""
     try:
-        # 检查是否为 git 仓库
-        r = subprocess.run(["git", "rev-parse", "--git-dir"],
-                           capture_output=True, timeout=3)
-        if r.returncode != 0:
-            return
+        r = subprocess.run(["git", "config", "--global", "core.excludesfile"],
+                           capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            path = r.stdout.strip()
+            return os.path.expanduser(path)
     except Exception:
-        return
-    gitignore_path = os.path.join(os.getcwd(), ".gitignore")
-    patterns = (".claude/settings.local.json\n", ".claude/ccms_settings.local.json\n", ".claude/\n", ".claude\n")
-    if os.path.isfile(gitignore_path):
-        with open(gitignore_path, "r", encoding="utf-8") as f:
+        pass
+    return None
+
+
+def _check_global_gitignore_rules():
+    """检查全局 gitignore 是否已包含 CCMS 忽略规则。
+
+    返回 (path, missing_patterns):
+    - path: 全局 gitignore 文件路径（未配置则为 None）
+    - missing_patterns: 缺失的规则列表
+    """
+    path = _get_global_gitignore_path()
+    required = [".claude/*local.json", ".claude/get-sk*"]
+    if not path:
+        return None, required
+    if not os.path.isfile(path):
+        return path, required
+    with open(path, "r", encoding="utf-8") as f:
+        content = f.read()
+    missing = [p for p in required if p not in content]
+    return path, missing
+
+
+def _ensure_global_gitignore():
+    """检查并配置全局 gitignore，追加 CCMS 忽略规则。"""
+    path, missing = _check_global_gitignore_rules()
+
+    # 未配置 core.excludesfile → 设置为 ~/.gitignore_global
+    if not path:
+        default_path = os.path.expanduser("~/.gitignore_global")
+        try:
+            subprocess.run(["git", "config", "--global", "core.excludesfile", default_path],
+                           capture_output=True, timeout=3, check=True)
+            path = default_path
+            _print_color(f"✔ 已设置 core.excludesfile → {default_path}\n", color="\033[32m")
+        except Exception as e:
+            _print_color(f"✘ 设置 core.excludesfile 失败: {e}\n", color="\033[31m")
+            return False
+
+    if not missing:
+        _print_color("✔ 全局 gitignore 已包含所有 CCMS 忽略规则\n", color="\033[32m")
+        return True
+
+    # 追加缺失规则
+    content = ""
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as f:
             content = f.read()
-        for pat in patterns:
-            pattern_line = pat.rstrip("\n")
-            if pattern_line in content:
-                return  # 已有忽略规则
-    else:
-        content = ""
-    # 追加忽略规则
-    lines_to_add = [".claude/settings.local.json\n", ".claude/ccms_settings.local.json\n"]
     if content and not content.endswith("\n"):
         content += "\n"
-    for line in lines_to_add:
-        if line.rstrip("\n") not in content:
-            content += line
-    with open(gitignore_path, "w", encoding="utf-8") as f:
+    for pattern in missing:
+        content += pattern + "\n"
+    with open(path, "w", encoding="utf-8") as f:
         f.write(content)
-    _print_color("✔ 已将 .claude/ 配置文件追加到 .gitignore\n", color="\033[32m")
+    _print_color(f"✔ 已将 CCMS 忽略规则追加到 {path}\n", color="\033[32m")
+    return True
 
 # ============================================================
 # 环境信息显示
@@ -1907,7 +1938,7 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str],
 def main():
     _setup_console()
     models = load_custom_models()
-    _ensure_gitignore()
+
 
     # 启动时一致性检查
     diffs = check_ccms_consistency()
@@ -2030,6 +2061,12 @@ def main():
                 cfg = _model_flat_config(models, rep) if aliases_sel else {"url": ep_cfg.get("url", ""), "modelName": "", "credential": {}}
                 write_model_to_project(rep, cfg, models)
                 _print_color(f"✔ 已切换至 {ep_name}，路由已应用\n", color="\033[32m")
+                # 检查全局 gitignore 是否配置
+                _, missing = _check_global_gitignore_rules()
+                if missing:
+                    ans = input_with_prompt("全局 gitignore 未配置 CCMS 忽略规则，是否现在配置？(Y/n) ")
+                    if ans.strip().lower() != "n":
+                        _ensure_global_gitignore()
                 _press_enter()
 
         # ---- 添加模型 (在当前 endpoint 下) ----
