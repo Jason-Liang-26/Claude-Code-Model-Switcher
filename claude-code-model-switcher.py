@@ -1034,19 +1034,22 @@ _ROLE_ENV_MAP = [
 ]
 
 
-def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None):
+def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None,
+                           project_routing: dict = None):
     """写入项目 .claude/settings.local.json (env 不含 sk) 并生成 helper 脚本。
 
-    路由来源: endpoint 的 defaultRouting，fallback 为当前模型。
+    路由来源: project_routing（项目级编辑）> endpoint defaultRouting > 当前模型。
     同时写入 ccms_settings.local.json 快照。"""
     settings = load_local_settings()
     if "env" not in settings:
         settings["env"] = {}
     env = settings["env"]
 
-    # 路由: endpoint defaultRouting → 当前模型
+    # 路由: 项目级 > endpoint defaultRouting > 当前模型
     routing = None
-    if v2_data:
+    if project_routing is not None:
+        routing = project_routing
+    elif v2_data:
         ep_name = _find_model(v2_data, alias)[0]
         ep = v2_data.get("endpoints", {}).get(ep_name, {}) if ep_name else {}
         routing = ep.get("defaultRouting")
@@ -1077,7 +1080,7 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None)
     _migrate_ccms_fields_from_project()
 
     # 写入 ccms_settings.local.json 快照
-    if v2_data and routing:
+    if v2_data and (routing or project_routing is not None):
         ep_name = _find_model(v2_data, alias)[0]
         snapshot = {"endpoint": ep_name or "", "routing": {}}
         for role, _ in _ROLE_ENV_MAP:
@@ -1928,9 +1931,11 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str],
         _print_color("✔ endpoint 默认路由已更新\n", color="\033[32m")
     else:
         # 写入项目级：settings.local.json + ccms_settings.local.json
-        if new_routing:
-            rep = new_routing.get("sonnet") or list(new_routing.values())[0]
-            write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data)
+        rep = new_routing.get("sonnet") or list(new_routing.values())[0] if new_routing else (
+            model_aliases[0] if model_aliases else "")
+        if rep:
+            write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data,
+                                   project_routing=new_routing)
         _print_color("✔ 当前项目路由已更新\n", color="\033[32m")
     _press_enter()
 
