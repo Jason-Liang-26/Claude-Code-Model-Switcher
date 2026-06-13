@@ -161,16 +161,18 @@ def select_from_list(items: list[str], title: str = "",
 
 def select_from_tabs(tabs: list[tuple[str, list[str]]],
                      common_items: list[str] | None = None,
-                     prompt: str = "← → 切换  ↑↓ 选择  Enter 确认  ESC 退出") -> str | None:
+                     prompt: str = "← → 切换  ↑↓ 选择  Enter 确认  ESC 退出",
+                     initial_tab: int = 0) -> str | None:
     """Tab 式菜单。← → 切换 tab，↑↓ 在 tab 内选择。
 
     tabs: [(标签名, [菜单项...]), ...] — 顺序即布局顺序
     common_items: 所有 tab 共享的底部项
-    返回选中的菜单项字符串，ESC 返回 None"""
+    initial_tab: 初始选中的 tab 索引
+    返回 (选中的菜单项字符串, 当前tab索引)，ESC 返回 None"""
     if not tabs:
         return None
     common = common_items or []
-    tab_idx = 0
+    tab_idx = initial_tab % len(tabs)
     item_idx = 0
     n_tabs = len(tabs)
 
@@ -242,7 +244,7 @@ def select_from_tabs(tabs: list[tuple[str, list[str]]],
                 continue
         elif ch in ("\r", "\n"):
             _clear_lines(last_lines[0])
-            return _all_items()[item_idx]
+            return _all_items()[item_idx], tab_idx
         elif ch == "\x03" or not ch:
             _clear_lines(last_lines[0])
             raise KeyboardInterrupt
@@ -261,35 +263,87 @@ def confirm(text: str, default_no: bool = False) -> bool:
         return not default_no
     return ch == "y"
 
-def input_with_prompt(prompt_text: str) -> str:
+def input_with_prompt(prompt_text: str, allow_empty: bool = False) -> str:
+    """带光标移动的行输入。支持 ← → Home End Delete，ESC 取消。"""
+    val = ""
+    pos = 0  # 光标在 val 中的位置
+
+    def _redraw():
+        """重绘：回到行首写 prompt+val，清除残余，用 SGR 定位光标到 pos"""
+        sys.stdout.write(f"\r{prompt_text}{val}\033[K")
+        # 用保存/恢复光标定位，避免列号计算在多字节字符下的偏差
+        n = len(val) - pos
+        if n > 0:
+            sys.stdout.write(f"\033[{n}D")  # 左移 n 列
+        sys.stdout.flush()
+
     sys.stdout.write(prompt_text)
     sys.stdout.flush()
-    val = ""
+
     while True:
         ch = _getch()
         if ch in ("\r", "\n"):
-            print()
-            if val: return val
+            sys.stdout.write("\n")
+            if val or allow_empty:
+                return val
             _print_color("（不能为空，请重新输入）\n", dim=True)
             sys.stdout.write(prompt_text)
             sys.stdout.flush()
-            continue
+            val, pos = "", 0
         elif ch in ("\x7f", "\x08"):
-            if val:
-                val = val[:-1]
-                sys.stdout.write("\b \b")
-                sys.stdout.flush()
+            if pos > 0:
+                val = val[:pos - 1] + val[pos:]
+                pos -= 1
+                _redraw()
         elif ch == "\x03":
             raise KeyboardInterrupt
+        elif ch == "\xe0":
+            ch2 = _getch()
+            if ch2 == "K" and pos > 0:          # ←
+                pos -= 1
+                _redraw()
+            elif ch2 == "M" and pos < len(val):  # →
+                pos += 1
+                _redraw()
+            elif ch2 == "S" and pos < len(val):  # Delete
+                val = val[:pos] + val[pos + 1:]
+                _redraw()
+            elif ch2 == "G":                     # Home
+                pos = 0
+                _redraw()
+            elif ch2 == "O":                     # End
+                pos = len(val)
+                _redraw()
         elif ch == "\x1b":
-            _print_color("（不支持方向键输入）\n", dim=True)
-            sys.stdout.write(prompt_text)
-            sys.stdout.flush()
-            continue
-        else:
-            val += ch
-            sys.stdout.write(ch)
-            sys.stdout.flush()
+            ch2 = _getch()
+            if ch2 == "[":
+                ch3 = _getch()
+                if ch3 == "D" and pos > 0:          # ←
+                    pos -= 1
+                    _redraw()
+                elif ch3 == "C" and pos < len(val):  # →
+                    pos += 1
+                    _redraw()
+                elif ch3 == "H":                     # Home
+                    pos = 0
+                    _redraw()
+                elif ch3 == "F":                     # End
+                    pos = len(val)
+                    _redraw()
+                elif ch3 == "3":
+                    ch4 = _getch()                  # \x1b[3~ → Delete
+                    if ch4 == "~" and pos < len(val):
+                        val = val[:pos] + val[pos + 1:]
+                        _redraw()
+                else:
+                    _getch()
+            else:
+                sys.stdout.write("\n")
+                return ""
+        elif ch and 0x20 <= ord(ch) <= 0x7e:
+            val = val[:pos] + ch + val[pos:]
+            pos += 1
+            _redraw()
 
 
 def _press_enter(prompt_text: str = "按 Enter 返回菜单..."):
@@ -1066,6 +1120,9 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None,
         for _, env_key in _ROLE_ENV_MAP:
             env[env_key] = mn
 
+    # 清除旧版 ANTHROPIC_MODEL（已由路由 env var 替代）
+    env.pop("ANTHROPIC_MODEL", None)
+
     # 活跃 endpoint 标记
     env["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
     if v2_data:
@@ -1339,13 +1396,6 @@ def check_ccms_consistency() -> list[tuple[str, str, str]]:
         local_mn = local_env.get(env_key, "")
         if ccms_mn and ccms_mn != local_mn:
             diffs.append((env_key, ccms_mn, local_mn))
-
-    # 比对 ANTHROPIC_MODEL / ANTHROPIC_BASE_URL
-    sonnet_entry = ccms_routing.get("sonnet", {})
-    if isinstance(sonnet_entry, dict) and sonnet_entry.get("modelName"):
-        ccms_model = sonnet_entry["modelName"]
-        if ccms_model != local_env.get("ANTHROPIC_MODEL", ""):
-            diffs.append(("ANTHROPIC_MODEL", ccms_model, local_env.get("ANTHROPIC_MODEL", "")))
 
     return diffs
 
@@ -1690,8 +1740,9 @@ def get_env_info_lines() -> list[tuple[str, str]]:
 # 路由管理
 # ============================================================
 
-def _endpoint_menu(v2_data: dict):
-    """Endpoint 管理子菜单：创建 / 删除。"""
+def _endpoint_menu(v2_data: dict) -> str:
+    """Endpoint 管理子菜单：创建 / 删除。返回最后的状态消息。"""
+    _last_msg = ""
     while True:
         print("\033[2J\033[H", end="")
         width = shutil.get_terminal_size().columns
@@ -1720,7 +1771,7 @@ def _endpoint_menu(v2_data: dict):
 
         idx = select_from_list(menu_items, prompt="↑↓ 选择 Enter 确认  ESC 返回")
         if idx is None or idx == len(menu_items) - 1:
-            return
+            return _last_msg
 
         if idx == 0:  # 创建
             print("\n\033[1m创建 Endpoint\033[0m")
@@ -1737,12 +1788,12 @@ def _endpoint_menu(v2_data: dict):
                 _print_color(f"  名称已存在，自动改为: {ep_name}-{i}\n", color="\033[33m")
                 ep_name = f"{ep_name}-{i}"
             sk = input_with_prompt("API Key (sk-...): ")
+            if not sk: continue
             cred = cred_default_config(ep_name)
             cred_store(cred, sk)
             endpoints[ep_name] = {"url": url, "credential": cred, "models": {}}
             save_custom_models(v2_data)
-            _print_color(f"✔ Endpoint \"{ep_name}\" 已创建\n", color="\033[32m")
-            _press_enter()
+            _last_msg = f"✔ Endpoint \"{ep_name}\" 已创建\n"
 
         elif idx == 1 and endpoints:  # 重命名
             ep_names = list(endpoints.keys())
@@ -1762,8 +1813,7 @@ def _endpoint_menu(v2_data: dict):
                                 s["env"]["CCMS_ENDPOINT"] = new_name
                                 save_local_settings(s)
                         save_custom_models(v2_data)
-                        _print_color(f"✔ {old_name} → {new_name}\n", color="\033[32m")
-            _press_enter()
+                        _last_msg = f"✔ {old_name} → {new_name}\n"
 
         elif idx == 2 and endpoints:  # 删除
             ep_names = list(endpoints.keys())
@@ -1781,12 +1831,11 @@ def _endpoint_menu(v2_data: dict):
                         _delete_model(v2_data, alias)
                     del endpoints[ep_name]
                     save_custom_models(v2_data)
-                    _print_color(f"✔ 已删除\n", color="\033[32m")
+                    _last_msg = "✔ 已删除\n"
                     aliases = _model_aliases(v2_data)
                     if aliases:
                         write_model_to_project(aliases[0],
                                                _model_flat_config(v2_data, aliases[0]), v2_data)
-            _press_enter()
 
 
 # ============================================================
@@ -1928,7 +1977,7 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str],
         if ep:
             ep["defaultRouting"] = new_routing
         save_custom_models(v2_data)
-        _print_color("✔ endpoint 默认路由已更新\n", color="\033[32m")
+        return "✔ endpoint 默认路由已更新\n"
     else:
         # 写入项目级：settings.local.json + ccms_settings.local.json
         rep = new_routing.get("sonnet") or list(new_routing.values())[0] if new_routing else (
@@ -1936,8 +1985,7 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str],
         if rep:
             write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data,
                                    project_routing=new_routing)
-        _print_color("✔ 当前项目路由已更新\n", color="\033[32m")
-    _press_enter()
+        return "✔ 当前项目路由已更新\n"
 
 
 def main():
@@ -1950,8 +1998,14 @@ def main():
     if diffs:
         _prompt_ccms_sync(diffs)
 
+    _status_msg = ""  # 操作成功/失败提示，下次渲染时显示一次后清除
+    _last_tab = 0     # 记住上次选中的 tab
+
     while True:
         print("\033[2J\033[H", end="")
+        if _status_msg:
+            _print_color(_status_msg, color="\033[32m")
+            _status_msg = ""
         width = shutil.get_terminal_size().columns
         _print_color(f"{' CCMS ':=^{width}}\n", bold=True)
 
@@ -2028,7 +2082,11 @@ def main():
                 ]),
             ]
             _COMMON = ["查看所有凭据", "退出"]
-            choice = select_from_tabs(_TABS, _COMMON)
+            result = select_from_tabs(_TABS, _COMMON, initial_tab=_last_tab)
+            if result is None:
+                choice = None
+            else:
+                choice, _last_tab = result
         else:
             _print_color("  暂无可用 Endpoint\n", color="\033[33m")
             choice = select_from_list(["创建 Endpoint", "退出"], prompt="↑↓ 选择 Enter 确认  ESC 退出")
@@ -2065,14 +2123,13 @@ def main():
                 rep = routing_to_apply.get("sonnet") or (aliases_sel[0] if aliases_sel else "none")
                 cfg = _model_flat_config(models, rep) if aliases_sel else {"url": ep_cfg.get("url", ""), "modelName": "", "credential": {}}
                 write_model_to_project(rep, cfg, models)
-                _print_color(f"✔ 已切换至 {ep_name}，路由已应用\n", color="\033[32m")
+                _status_msg = f"✔ 已切换至 {ep_name}，路由已应用\n"
                 # 检查全局 gitignore 是否配置
                 _, missing = _check_global_gitignore_rules()
                 if missing:
                     ans = input_with_prompt("全局 gitignore 未配置 CCMS 忽略规则，是否现在配置？(Y/n) ")
                     if ans.strip().lower() != "n":
                         _ensure_global_gitignore()
-                _press_enter()
 
         # ---- 添加模型 (在当前 endpoint 下) ----
         elif choice == "添加模型":
@@ -2086,8 +2143,7 @@ def main():
             ep = endpoints[active_ep]
             _upsert_model(models, alias, ep["url"], mn, ep.get("credential", {}))
             save_custom_models(models)
-            _print_color(f"✔ 已添加: {alias} → {mn}\n", color="\033[32m")
-            _press_enter()
+            _status_msg = f"✔ 已添加: {alias} → {mn}\n"
 
         # ---- 删除模型 ----
         elif choice == "删除模型":
@@ -2097,16 +2153,17 @@ def main():
                 if confirm(f"确定删除 \"{alias}\" 吗？", default_no=True):
                     _delete_model(models, alias)
                     save_custom_models(models)
-                    _print_color(f"✔ 已删除\n", color="\033[32m")
-            _press_enter()
+                    _status_msg = "✔ 已删除\n"
 
         # ---- 编辑 endpoint 默认路由 ----
         elif choice == "编辑 endpoint 默认路由":
-            _routing_picker(models, active_ep, model_aliases, scope="endpoint")
+            msg = _routing_picker(models, active_ep, model_aliases, scope="endpoint")
+            if msg: _status_msg = msg
 
         # ---- 编辑当前项目路由 ----
         elif choice == "编辑当前项目路由":
-            _routing_picker(models, active_ep, model_aliases, scope="project")
+            msg = _routing_picker(models, active_ep, model_aliases, scope="project")
+            if msg: _status_msg = msg
             # 重载（routing 可能已变更）
         # ---- 修改凭据 ----
         elif choice == "修改凭据":
@@ -2120,13 +2177,12 @@ def main():
                 if model_aliases:
                     write_model_to_project(model_aliases[0],
                                            _model_flat_config(models, model_aliases[0]), models)
-                _print_color(f"✔ 凭据已更新\n", color="\033[32m")
-            _press_enter()
+                _status_msg = "✔ 凭据已更新\n"
 
         # ---- 管理 Endpoints ----
         elif choice == "管理 Endpoints":
-            _endpoint_menu(models)
-            _press_enter()
+            msg = _endpoint_menu(models)
+            if msg: _status_msg = msg
 
         # ---- 创建 Endpoint (无 endpoint 时的初始状态) ----
         elif choice == "创建 Endpoint":
@@ -2138,16 +2194,15 @@ def main():
             if not ep_name:
                 ep_name = default_name
             if ep_name in endpoints:
-                _print_color("名称已存在\n", color="\033[31m")
-                _press_enter()
+                _status_msg = "\033[31m✗ 名称已存在\n\033[0m"
                 continue
             sk = input_with_prompt("API Key (sk-...): ")
+            if not sk: continue
             cred = cred_default_config(ep_name)
             cred_store(cred, sk)
             endpoints[ep_name] = {"url": url, "credential": cred, "models": {}}
             save_custom_models(models)
-            _print_color(f"✔ Endpoint \"{ep_name}\" 已创建\n", color="\033[32m")
-            _press_enter()
+            _status_msg = f"✔ Endpoint \"{ep_name}\" 已创建\n"
 
         # ---- 查看所有凭据 ----
         elif choice == "查看所有凭据":
