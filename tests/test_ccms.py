@@ -795,6 +795,145 @@ class TestWriteModelToProject(unittest.TestCase):
         self.assertEqual(env["CLAUDE_CODE_SUBAGENT_MODEL"], "model-two")
 
 
+class TestMigrateOldV2(unittest.TestCase):
+    """_migrate_old_v2 — 旧 v2（顶层 models/routing）→ 新 v2（endpoint 内 models）"""
+
+    def test_migrates_top_level_models_into_endpoint(self):
+        old = {
+            "endpoints": {
+                "example": {"url": "https://api.example.com", "credential": {}},
+            },
+            "models": {
+                "m1": {"modelName": "model-one", "endpoint": "example"},
+            },
+            "routing": {"opus": "m1"},
+            "_version": 1,
+        }
+        result = ccms._migrate_old_v2(old)
+        # 顶层残留键应被删除
+        self.assertNotIn("models", result)
+        self.assertNotIn("routing", result)
+        self.assertNotIn("_version", result)
+        # 模型应迁入 endpoint
+        ep = result["endpoints"]["example"]
+        self.assertIn("m1", ep["models"])
+        self.assertEqual(ep["models"]["m1"]["modelName"], "model-one")
+        # defaultRouting 自动填充为 4 角色指向该模型
+        for role in ("opus", "sonnet", "haiku", "subagent"):
+            self.assertEqual(ep["defaultRouting"][role], "m1")
+
+    def test_drops_models_without_matching_endpoint(self):
+        old = {
+            "endpoints": {"example": {"url": "u", "credential": {}}},
+            "models": {"orphan": {"modelName": "x", "endpoint": "ghost"}},
+            "routing": {},
+        }
+        result = ccms._migrate_old_v2(old)
+        # orphan 引用的 endpoint 不存在 → 不迁入，但不报错
+        self.assertNotIn("models", result)
+        self.assertNotIn("models", result["endpoints"]["example"])
+
+    def test_preserves_existing_endpoint_models(self):
+        old = {
+            "endpoints": {"example": {
+                "url": "u", "credential": {},
+                "models": {"kept": {"modelName": "kept-model"}},
+            }},
+            "models": {"m1": {"modelName": "model-one", "endpoint": "example"}},
+            "routing": {},
+        }
+        result = ccms._migrate_old_v2(old)
+        ep = result["endpoints"]["example"]
+        self.assertIn("kept", ep["models"])
+        self.assertIn("m1", ep["models"])
+
+
+class TestCheckCcmsConsistency(unittest.TestCase):
+    """check_ccms_consistency — ccms_settings 快照 vs settings.local.json env"""
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        td = str(Path(self.tmpdir.name))
+        self.local_path = Path(td) / "settings.local.json"
+        self.ccms_path = Path(td) / "ccms_settings.local.json"
+        self.local_path.parent.mkdir(parents=True, exist_ok=True)
+        self.patches = [
+            mock.patch("ccms.LOCAL_SETTINGS_PATH", str(self.local_path)),
+            mock.patch("ccms.CCMS_SETTINGS_PATH", str(self.ccms_path)),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self.tmpdir.cleanup()
+
+    def _write(self, local_env, ccms_data):
+        self.local_path.write_text(
+            json.dumps({"env": local_env}), encoding="utf-8")
+        self.ccms_path.write_text(
+            json.dumps(ccms_data), encoding="utf-8")
+
+    def test_empty_when_no_ccms_snapshot(self):
+        # 无 ccms_settings → 不做比对
+        self.assertEqual(ccms.check_ccms_consistency(), [])
+
+    def test_consistent_when_all_match(self):
+        self._write(
+            local_env={
+                "CCMS_ENDPOINT": "ep1",
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": "model-one",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "model-one",
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": "model-one",
+                "CLAUDE_CODE_SUBAGENT_MODEL": "model-one",
+            },
+            ccms_data={
+                "endpoint": "ep1",
+                "routing": {r: {"alias": "m1", "modelName": "model-one"}
+                            for r in ("opus", "sonnet", "haiku", "subagent")},
+            },
+        )
+        self.assertEqual(ccms.check_ccms_consistency(), [])
+
+    def test_diff_when_endpoint_mismatches(self):
+        self._write(
+            local_env={"CCMS_ENDPOINT": "ep1"},
+            ccms_data={"endpoint": "ep2", "routing": {}},
+        )
+        diffs = ccms.check_ccms_consistency()
+        self.assertEqual(len(diffs), 1)
+        self.assertEqual(diffs[0][0], "CCMS_ENDPOINT")
+        self.assertEqual(diffs[0][1], "ep2")
+        self.assertEqual(diffs[0][2], "ep1")
+
+    def test_diff_when_role_model_name_mismatches(self):
+        self._write(
+            local_env={
+                "CCMS_ENDPOINT": "ep1",
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": "model-old",
+            },
+            ccms_data={
+                "endpoint": "ep1",
+                "routing": {"sonnet": {"alias": "m1", "modelName": "model-new"}},
+            },
+        )
+        diffs = ccms.check_ccms_consistency()
+        self.assertEqual(len(diffs), 1)
+        self.assertEqual(diffs[0][0], "ANTHROPIC_DEFAULT_SONNET_MODEL")
+        self.assertEqual(diffs[0][1], "model-new")
+        self.assertEqual(diffs[0][2], "model-old")
+
+    def test_no_diff_when_snapshot_missing_role(self):
+        """快照中某角色未配置（modelName 为空）→ 不视为差异。"""
+        self._write(
+            local_env={"CCMS_ENDPOINT": "ep1",
+                       "ANTHROPIC_DEFAULT_OPUS_MODEL": "model-one"},
+            ccms_data={"endpoint": "ep1", "routing": {}},
+        )
+        self.assertEqual(ccms.check_ccms_consistency(), [])
+
+
 class TestGetCurrentAliasV2(unittest.TestCase):
     """get_current_alias — v2 数据模型兼容"""
 

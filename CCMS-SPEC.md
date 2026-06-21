@@ -114,6 +114,8 @@ CCMS 写入此文件（local 层），因为是开发者个人偏好而非项目
 | `CLAUDE_CODE_SUBAGENT_MODEL` | 子代理使用的模型 ID |
 | `CCMS_ENDPOINT` | 当前活跃的 Endpoint 名称 |
 
+> **v1 遗留**：`CCMS_MODEL_ALIAS` 是 v1 时代的托管标记，v2 已不再写入。切换模型时自动清除（`env.pop("CCMS_MODEL_ALIAS", None)`），`_migrate_ccms_fields_from_project()` 也会从项目 `settings.json` 中清理。
+
 ### .claude/ccms_settings.local.json（项目本地、CWD、gitignored）
 
 CCMS 路由快照文件，记录当前项目的 Endpoint 和路由配置。用于 `--get-sk` 和一致性检查。

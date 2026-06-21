@@ -928,6 +928,7 @@ _CCMS_MANAGED_ENV_KEYS = (
     "CLAUDE_CODE_SUBAGENT_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "CCMS_ENDPOINT",
+    "CCMS_MODEL_ALIAS",  # v1 遗留标记，v2 已不写入，迁移时清除
 )
 
 
@@ -1124,6 +1125,8 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None,
 
     # 清除旧版 ANTHROPIC_MODEL（已由路由 env var 替代）
     env.pop("ANTHROPIC_MODEL", None)
+    # 清除 v1 遗留标记 CCMS_MODEL_ALIAS（v2 路由已取代，惰性清理）
+    env.pop("CCMS_MODEL_ALIAS", None)
 
     # 活跃 endpoint 标记
     env["ANTHROPIC_BASE_URL"] = model_config.get("url", "")
@@ -1214,22 +1217,12 @@ def _generate_helper_scripts():
 # 导出 / 迁移工具
 # ============================================================
 
-def _get_sk(model_name: str, model_config: dict) -> str | None:
+def _get_sk(model_config: dict) -> str | None:
     """从凭据后端取 sk"""
     cred = model_config.get("credential", {})
     if not cred:
         return None
     return cred_retrieve(cred)
-
-def print_env_export(alias: str, model_config: dict):
-    sk = _get_sk(alias, model_config)
-    if not sk:
-        return
-    print(f"""\n\033[33m⚠  如需在当前终端设置认证凭据，请执行:\033[0m
-  \033[1mexport ANTHROPIC_API_KEY="{sk}"
-  export ANTHROPIC_AUTH_TOKEN="{sk}"\033[0m
-\033[2m或使用 eval 模式: python claude-code-model-switcher.py --env\033[0m
-""")
 
 def cmd_env(args: list[str]):
     """--env 模式: 输出 export 命令"""
@@ -1241,7 +1234,7 @@ def cmd_env(args: list[str]):
         result = resolve_model(target_arg, models)
         if result:
             _alias, cfg = result
-            sk = _get_sk(_alias, cfg)
+            sk = _get_sk(cfg)
             if sk:
                 print(f'export ANTHROPIC_API_KEY="{sk}"')
                 print(f'export ANTHROPIC_AUTH_TOKEN="{sk}"')
@@ -1293,7 +1286,7 @@ def cmd_reveal():
         mn = cfg.get("modelName", alias)
         cred = cfg.get("credential", {})
         backend = cred.get("type", "无")
-        sk = _get_sk(alias, cfg)
+        sk = _get_sk(cfg)
         status = "\033[32m可用\033[0m" if sk else "\033[31m不可用\033[0m"
         sk_preview = (sk[:8] + "...") if sk else "-"
         ep = cfg.get("endpoint", "")
@@ -1316,7 +1309,7 @@ def cmd_reveal():
     if confirm("导出全部 sk 到 stdout（JSON 格式，用于迁移）？", default_no=True):
         out = {}
         for alias, cfg in _iter_models(models):
-            sk = _get_sk(alias, cfg)
+            sk = _get_sk(cfg)
             out[alias] = {"url": cfg.get("url", ""), "credential": cfg.get("credential", {}),
                          "sk": sk or ""}
         print(json.dumps(out, indent=2, ensure_ascii=False))
@@ -2214,7 +2207,7 @@ def main():
                 mn = cfg.get("modelName", alias)
                 cred = cfg.get("credential", {})
                 backend = cred.get("type", "无")
-                sk = _get_sk(alias, cfg)
+                sk = _get_sk(cfg)
                 status = "\033[32m可用\033[0m" if sk else "\033[31m不可用\033[0m"
                 sk_preview = (sk[:8] + "...") if sk else "-"
                 ep = cfg.get("endpoint", "")
@@ -2246,7 +2239,7 @@ if __name__ == "__main__":
             print()
             print("选项:")
             print("  --env [模型名]        输出 export 命令（eval 用）")
-            print("  --get-sk [模型名]     输出原始 sk（供 apiKeyHelper 调用）")
+            print("  --get-sk             输出当前项目的 sk（供 apiKeyHelper 调用）")
             print("  --reveal              展示所有模型凭据状态")
             print("  --migrate-import      从 stdin JSON 批量导入 sk")
             print("  (无参数)              交互式菜单")

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-CCMS is a single-file Python script (`claude-code-model-switcher.py`, ~1000 lines) that manages custom model configurations for Claude Code. It stores API keys in the OS native credential manager and generates `apiKeyHelper` scripts so Claude Code can retrieve keys at runtime.
+CCMS is a single-file Python script (`claude-code-model-switcher.py`, ~2300 lines) that manages custom model configurations for Claude Code. It uses a v2 Endpoint architecture (`~/.claude/ccms-endpoints.json`) where each Endpoint groups a URL + credential + multiple models + role routing. It stores API keys in the OS native credential manager and generates `apiKeyHelper` scripts so Claude Code can retrieve keys at runtime.
 
 **Key constraint: zero third-party dependencies. Python 3.8+ only.**
 
@@ -25,8 +25,8 @@ python -m unittest tests.test_ccms.TestResolveModel
 # Interactive menu (primary verification)
 python claude-code-model-switcher.py
 
-# Test credential retrieval for a specific model
-python claude-code-model-switcher.py --get-sk <alias-or-modelName>
+# Test credential retrieval for the current project (reads ccms_settings.local.json)
+python claude-code-model-switcher.py --get-sk
 
 # Check credential status across all models
 python claude-code-model-switcher.py --reveal
@@ -47,14 +47,30 @@ All project-level paths are resolved against `os.getcwd()` at module load time:
 
 **Critical implication**: running the script from `~` writes to `~/.claude/settings.local.json` (the user-level config), silently affecting all unconfigured projects. A guard (`is_global_config_dir()`) detects this and shows warnings + requires confirmation.
 
-### Three-Layer Data Model
+### Data Model (v2 Endpoint Architecture)
 
-| Layer | Storage | Content |
-|-------|---------|---------|
-| Global models | `~/.claude/custom-models.json` | Alias, URL, modelName, credential reference (no sk) |
-| Local config | `.claude/settings.local.json` | CCMS-managed: `env.ANTHROPIC_BASE_URL`, `env.ANTHROPIC_MODEL`, `apiKeyHelper` (local layer, gitignored) |
-| Project config | `.claude/settings.json` | Non-CCMS fields preserved; CCMS reads merged local + project |
-| Credentials | OS credential manager / `~/.local/share/ccms/` | Actual sk (DPAPI / Keychain / age / openssl / secret-service) |
+| File | Scope | Content |
+|------|-------|---------|
+| `~/.claude/ccms-endpoints.json` | Global (user) | Endpoint → Model → Routing. Each endpoint: `url`, `credential` (backend params, no sk), `models` (alias→modelName), `defaultRouting` (role→alias). See `MODELS_PATH`. |
+| `.claude/settings.local.json` | Project (gitignored) | CCMS-managed `env`: 4 route env vars + `CCMS_ENDPOINT` + `ANTHROPIC_BASE_URL`, plus `apiKeyHelper`. See `LOCAL_SETTINGS_PATH`. |
+| `.claude/ccms_settings.local.json` | Project (gitignored) | Routing snapshot (endpoint + role→alias→modelName). Used by `--get-sk` and consistency check. See `CCMS_SETTINGS_PATH`. |
+| `.claude/settings.json` | Project (committed) | Non-CCMS fields preserved. CCMS fields migrated to `settings.local.json` by `_migrate_ccms_fields_from_project()`. |
+| OS credential manager / `~/.local/share/ccms/` | OS / filesystem | Actual sk. DPAPI / Keychain / age / openssl / secret-service. |
+
+Legacy: `~/.claude/custom-models.json` (`LEGACY_MODELS_PATH`) is auto-migrated to `ccms-endpoints.json` on first load.
+
+### Role Routing
+
+CCMS routes 4 Claude Code roles to distinct models. Defined in `_ROLE_ENV_MAP`:
+
+| Role | Environment Variable |
+|------|---------------------|
+| opus | `ANTHROPIC_DEFAULT_OPUS_MODEL` |
+| sonnet | `ANTHROPIC_DEFAULT_SONNET_MODEL` |
+| haiku | `ANTHROPIC_DEFAULT_HAIKU_MODEL` |
+| subagent | `CLAUDE_CODE_SUBAGENT_MODEL` |
+
+Priority: project routing (`ccms_settings.local.json`) > endpoint `defaultRouting` > fallback (all roles → current model).
 
 ### Credential Backend Abstraction
 
@@ -68,7 +84,7 @@ Platform-specific backends are hidden behind `cred_store(cred, sk)` / `cred_retr
 
 Linux backend selection: `_is_gui_session()` checks `$DISPLAY` / `$WAYLAND_DISPLAY`. GUI → secret-service. Headless → age (if installed) → linux-file/openssl.
 
-The `credential` dict in `custom-models.json` carries backend-specific params (e.g. `{"type": "age", "identity": "~/.local/share/ccms/identity.age", "keyname": "alias"}`).
+The `credential` dict in `ccms-endpoints.json` carries backend-specific params (e.g. `{"type": "age", "identity": "~/.local/share/ccms/identity.age", "keyname": "alias"}`).
 
 ### apiKeyHelper Mechanism
 
@@ -77,16 +93,16 @@ When switching models, `_generate_helper_scripts()` creates:
 - `.claude/get-sk.ps1` — Windows PowerShell, calls `python ... --get-sk`
 - `.claude/get-sk.sh` — WSL/Bash, with WSL path conversion (`C:\...` → `/mnt/c/...`)
 
-Both embed absolute paths at generation time (no runtime path resolution). The helper reads `settings.local.json` to get the current model, then calls `--get-sk` to retrieve the sk from the OS credential manager.
+Both embed absolute paths at generation time (no runtime path resolution). The helper calls `--get-sk`, which reads `ccms_settings.local.json` to get the current endpoint, then looks up the credential in `ccms-endpoints.json` and retrieves the sk from the OS credential manager.
 
 **WSL nuance**: WSL Python cannot access Windows DPAPI. The script ensures the Windows Python executable (`python.exe`) is used in WSL, which has the Windows user token and can call `advapi32`.
 
 ### Auto-Migration
 
-`migrate_models()` runs on every load. It handles two legacy formats:
+`load_custom_models()` runs on every load and performs lazy migration:
 
-1. Missing `modelName` → auto-populate from alias
-2. Plaintext `sk` field → move to OS credential manager, replace with `credential` reference
+1. **v1 → v2** (`_import_legacy()`): Converts flat `custom-models.json` (`{alias: {url, modelName, sk/credential}}`) into v2 Endpoint architecture. Models sharing the same URL+credential are grouped under one Endpoint. Plaintext `sk` fields are moved to OS credential manager, replaced with `credential` reference.
+2. **Old v2 → current v2** (`_migrate_old_v2()`): Migrates data where `models` and `routing` were top-level keys (alongside `endpoints`) into the current structure where each model lives inside its parent endpoint and `defaultRouting` is per-endpoint. Old top-level `models`/`routing`/`_version` keys are removed.
 
 ## Commit Co-Authored-By
 

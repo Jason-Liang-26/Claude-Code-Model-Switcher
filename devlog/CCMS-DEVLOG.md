@@ -215,6 +215,36 @@
 
 ---
 
+## Phase 14: Review 清理与文档同步 (v0.14)
+
+**目标**：修复整体 review 发现的文档与代码脱节、孤儿 env var、死代码，补齐核心函数单测
+
+**发现问题**：
+- `CLAUDE.md` 仍描述 v1 架构（`custom-models.json`、`migrate_models()`、`ANTHROPIC_MODEL`、~1000 行），实际已是 v2 的 Endpoint→Model→Routing 三层（`ccms-endpoints.json`、4 路角色路由、~2300 行）
+- `--get-sk` 的 `--help` 文本暗示可传模型名参数，但 `cmd_get_sk()` 已不读 args（从 `ccms_settings.local.json` 读 endpoint）
+- v1 遗留的 `CCMS_MODEL_ALIAS` env var（Phase 5 写入）在 v2 中不再写入，但仍残留在 `settings.local.json` 且未被清理
+- `print_env_export` 函数无调用方（`cmd_env` 自行 print），属于死代码
+- `_get_sk(model_name, model_config)` 的 `model_name` 参数未使用
+- `_migrate_old_v2` 和 `check_ccms_consistency` 两个核心函数零测试覆盖
+
+**修复**：
+- 重写 `CLAUDE.md` Architecture 小节：v2 数据模型表（5 层）、角色路由（`_ROLE_ENV_MAP`）、迁移函数（`_import_legacy` / `_migrate_old_v2`）、apiKeyHelper 流程
+- `--get-sk` 帮助文本：删除 `[模型名]`，改为"输出当前项目的 sk"
+- `_CCMS_MANAGED_ENV_KEYS` 追加 `CCMS_MODEL_ALIAS`，`write_model_to_project` 新增 `env.pop("CCMS_MODEL_ALIAS", None)` 惰性清理
+- 删除 `print_env_export` 死代码，`_get_sk` 签名简化为 `_get_sk(model_config)`
+- 新增 `TestMigrateOldV2`（3 个用例）和 `TestCheckCcmsConsistency`（5 个用例）共 8 个测试
+- 删除误入仓库的 `bash.exe.stackdump`，`.gitignore` 追加 `*.stackdump`
+- 更新 `CCMS-SPEC.md`：环境变量表后加 `CCMS_MODEL_ALIAS` 不再写入的说明
+
+**测试结果**：85 tests, OK
+
+**deferred**（行为变更范围，不在本次清理中）：
+- `_infer_endpoint_name` 的 ccTLD 完整处理（需 publicsuffix 表）
+- age/linux-file keyname 路径净化（防 `a/b` 创建子目录）
+- 删除活跃 endpoint 后陈旧快照刷新
+
+---
+
 ## 产物清单
 
 | 文件 | 说明 |
@@ -228,4 +258,4 @@
 | `CLAUDE.md` | Claude Code 指引 |
 | `devlog/CCMS-DEVLOG.md` | 本文档 |
 | `claude-code-model-switcher-help.md` | 用户手册 |
-| `tests/test_ccms.py` | 单元测试 (30 cases, stdlib) |
+| `tests/test_ccms.py` | 单元测试 (85 cases, stdlib) |
