@@ -984,5 +984,64 @@ class TestGetCurrentAliasV2(unittest.TestCase):
         self.assertEqual(ccms.get_current_alias(v2), "m2")
 
 
+class TestCheckAttributionHeader(unittest.TestCase):
+    """_check_attribution_header — CLAUDE_CODE_ATTRIBUTION_HEADER 诊断"""
+
+    def test_ok_when_string_0(self):
+        settings = {"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "0"}}
+        result = ccms._check_attribution_header(settings)
+        self.assertEqual(result["status"], "ok")
+
+    def test_ok_when_int_0(self):
+        settings = {"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": 0}}
+        result = ccms._check_attribution_header(settings)
+        self.assertEqual(result["status"], "ok")
+
+    def test_warn_when_missing(self):
+        result = ccms._check_attribution_header({})
+        self.assertEqual(result["status"], "warn")
+
+    def test_warn_when_wrong_value(self):
+        settings = {"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "1"}}
+        result = ccms._check_attribution_header(settings)
+        self.assertEqual(result["status"], "warn")
+
+    def test_warn_when_no_env(self):
+        settings = {"permissions": {"allow": []}}
+        result = ccms._check_attribution_header(settings)
+        self.assertEqual(result["status"], "warn")
+
+
+class TestCmdDiagnose(unittest.TestCase):
+    """cmd_diagnose — 诊断 + 交互式修复"""
+
+    @mock.patch("ccms.load_user_settings",
+                return_value={"env": {"CLAUDE_CODE_ATTRIBUTION_HEADER": "0"}})
+    def test_all_ok_no_fix_prompt(self, _mock):
+        """所有检查通过时不应提示修复"""
+        # cmd_diagnose 不会调用 confirm()，不报错即通过
+        ccms.cmd_diagnose()
+
+    @mock.patch("ccms.save_user_settings")
+    @mock.patch("ccms.confirm", return_value=True)
+    @mock.patch("ccms.load_user_settings", return_value={})
+    def test_warn_and_fix(self, mock_load, mock_confirm, mock_save):
+        """检查不通过时提示修复，用户确认后写入"""
+        ccms.cmd_diagnose()
+        self.assertTrue(mock_confirm.called)
+        mock_save.assert_called_once()
+        written = mock_save.call_args[0][0]
+        self.assertEqual(written["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"], "0")
+
+    @mock.patch("ccms.save_user_settings")
+    @mock.patch("ccms.confirm", return_value=False)
+    @mock.patch("ccms.load_user_settings", return_value={})
+    def test_warn_and_skip_fix(self, mock_load, mock_confirm, mock_save):
+        """检查不通过时用户拒绝修复 → 不写入"""
+        ccms.cmd_diagnose()
+        self.assertTrue(mock_confirm.called)
+        mock_save.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

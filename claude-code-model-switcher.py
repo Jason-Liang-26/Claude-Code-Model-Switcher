@@ -872,6 +872,14 @@ def load_user_settings() -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
+def save_user_settings(settings: dict):
+    """写入 ~/.claude/settings.json（用户级全局配置）"""
+    path = os.path.expanduser("~/.claude/settings.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(settings, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
 def load_local_settings() -> dict:
     """读取 .claude/settings.local.json"""
     if not os.path.isfile(LOCAL_SETTINGS_PATH):
@@ -1654,6 +1662,66 @@ def _ensure_global_gitignore():
     return True
 
 # ============================================================
+# 配置诊断
+# ============================================================
+
+def _check_attribution_header(user_settings: dict) -> dict:
+    """检查 CLAUDE_CODE_ATTRIBUTION_HEADER 是否设置为 0（禁用归属块优化 prompt cache）。"""
+    val = user_settings.get("env", {}).get("CLAUDE_CODE_ATTRIBUTION_HEADER")
+    if val == "0" or val == 0:
+        return {"status": "ok", "message": "归属块已禁用，prompt cache 命中率已优化"}
+    return {"status": "warn",
+            "message": "禁用归属块可改善通过 LLM 网关路由时的 prompt caching 命中率"}
+
+
+# 诊断规则注册表：未来扩展只需 append 新 dict
+_DIAGNOSTIC_RULES = [
+    {
+        "id": "attribution-header",
+        "name": "Prompt Cache 优化",
+        "description": "检查 CLAUDE_CODE_ATTRIBUTION_HEADER 是否设置为 0",
+        "check": _check_attribution_header,
+        "fix_key": "CLAUDE_CODE_ATTRIBUTION_HEADER",
+        "fix_value": "0",
+        "fix_description": "设置 env.CLAUDE_CODE_ATTRIBUTION_HEADER=0",
+    },
+]
+
+
+def cmd_diagnose():
+    """--diagnose 模式: 检查 ~/.claude/settings.json 是否符合最佳实践"""
+    _print_color("配置诊断 (~/.claude/settings.json)\n\n", bold=True)
+
+    user_settings = load_user_settings()
+    warnings = []
+
+    for rule in _DIAGNOSTIC_RULES:
+        result = rule["check"](user_settings)
+        if result["status"] == "ok":
+            _print_color(f"  ✔ {rule['name']}\n", color="\033[32m")
+        else:
+            _print_color(f"  ✗ {rule['name']}\n", color="\033[31m")
+            warnings.append((rule, result))
+        _print_color(f"    {result['message']}\n\n", dim=True)
+
+    if not warnings:
+        _print_color("所有检查项均已通过。\n", color="\033[32m")
+        return
+
+    # 交互式询问是否修复
+    for rule, result in warnings:
+        _print_color(f"修复建议: {rule['fix_description']}\n", color="\033[33m")
+        if confirm("是否修复？", default_no=True):
+            env = user_settings.setdefault("env", {})
+            env[rule["fix_key"]] = rule["fix_value"]
+            save_user_settings(user_settings)
+            _print_color(f"✔ 已写入 {rule['fix_key']}={rule['fix_value']}\n",
+                         color="\033[32m")
+        else:
+            _print_color("已跳过\n", dim=True)
+
+
+# ============================================================
 # 环境信息显示
 # ============================================================
 
@@ -2076,7 +2144,7 @@ def main():
                     "删除模型",
                 ]),
             ]
-            _COMMON = ["查看所有凭据", "退出"]
+            _COMMON = ["查看所有凭据", "配置诊断", "退出"]
             result = select_from_tabs(_TABS, _COMMON, initial_tab=_last_tab)
             if result is None:
                 choice = None
@@ -2084,9 +2152,9 @@ def main():
                 choice, _last_tab = result
         else:
             _print_color("  暂无可用 Endpoint\n", color="\033[33m")
-            choice = select_from_list(["创建 Endpoint", "退出"], prompt="↑↓ 选择 Enter 确认  ESC 退出")
+            choice = select_from_list(["创建 Endpoint", "配置诊断", "退出"], prompt="↑↓ 选择 Enter 确认  ESC 退出")
             if choice is not None:
-                choice = ["创建 Endpoint", "退出"][choice]
+                choice = ["创建 Endpoint", "配置诊断", "退出"][choice]
 
         if choice is None:
             break
@@ -2214,6 +2282,11 @@ def main():
                 print(f"{alias:<20} {mn:<25} {ep:<15} {backend:<22} {status:<10} {sk_preview}")
             _press_enter()
 
+        # ---- 配置诊断 ----
+        elif choice == "配置诊断":
+            cmd_diagnose()
+            _press_enter()
+
         elif choice == "退出":
             break
 
@@ -2234,6 +2307,8 @@ if __name__ == "__main__":
             cmd_reveal()
         elif cmd == "--migrate-import":
             cmd_migrate_import()
+        elif cmd == "--diagnose":
+            cmd_diagnose()
         elif cmd == "--help":
             print("用法: python claude-code-model-switcher.py [选项]")
             print()
@@ -2242,6 +2317,7 @@ if __name__ == "__main__":
             print("  --get-sk             输出当前项目的 sk（供 apiKeyHelper 调用）")
             print("  --reveal              展示所有模型凭据状态")
             print("  --migrate-import      从 stdin JSON 批量导入 sk")
+            print("  --diagnose            诊断用户配置是否符合最佳实践")
             print("  (无参数)              交互式菜单")
         else:
             _print_color(f"未知选项: {cmd}\n", color="\033[31m")

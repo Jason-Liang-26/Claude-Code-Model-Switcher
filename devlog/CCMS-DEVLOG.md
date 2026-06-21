@@ -245,6 +245,29 @@
 
 ---
 
+## Phase 15: 配置诊断功能 (v0.15)
+
+**目标**：新增 `--diagnose` CLI 模式 + 菜单"配置诊断"，检查 `~/.claude/settings.json` 是否符合最佳实践
+
+**背景**：Claude Code 默认在系统提示开头插入归属块（客户端版本 + prompt fingerprint）。当通过 LLM 网关路由时，该指纹每次请求不同，导致 prompt cache 无法命中，产生大量 cache missing 费用。设置 `env.CLAUDE_CODE_ATTRIBUTION_HEADER=0` 可禁用此行为。
+
+**实现**：
+- `save_user_settings()`：新增写入 `~/.claude/settings.json` 的函数（之前只有 `load_user_settings`）
+- `_check_attribution_header(user_settings)`：检查 `CLAUDE_CODE_ATTRIBUTATION_HEADER` 是否为 `"0"`
+- `_DIAGNOSTIC_RULES` 列表：规则注册表，未来扩展只需 append 新 dict
+- `cmd_diagnose()`：遍历规则，输出状态，有 warn 时交互式询问是否修复
+- CLI 入口 `--diagnose` 分支
+- 交互菜单 `_COMMON` 新增"配置诊断"选项（有 endpoint 和无 endpoint 两种状态）
+
+**测试**：
+- `TestCheckAttributionHeader`：5 个用例（ok string/int、warn missing/wrong/no-env）
+- `TestCmdDiagnose`：3 个用例（all-ok、warn+fix、warn+skip）
+- 合计 93 tests
+
+**调试记录**：测试中发现 env var 拼写问题——`CLAUDE_CODE_ATTRIBUTION_HEADER`（正确，30 字符）vs `CLAUDE_CODE_ATTRIBUTATION_HEADER`（错误，32 字符，多了一个 `AT`）。通过字节级比较定位：key 第 20 字节 `0x49`(I) vs `0x41`(A)，差 2 个字符。
+
+---
+
 ## 产物清单
 
 | 文件 | 说明 |
@@ -258,4 +281,4 @@
 | `CLAUDE.md` | Claude Code 指引 |
 | `devlog/CCMS-DEVLOG.md` | 本文档 |
 | `claude-code-model-switcher-help.md` | 用户手册 |
-| `tests/test_ccms.py` | 单元测试 (85 cases, stdlib) |
+| `tests/test_ccms.py` | 单元测试 (93 cases, stdlib) |
