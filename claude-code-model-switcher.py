@@ -994,17 +994,17 @@ def resolve_model(target: str, models: dict) -> tuple[str, dict] | None:
 
 
 def _infer_endpoint_name(url: str) -> str:
-    """从 URL hostname 推断 endpoint 名称"""
+    """从 URL hostname 推断 endpoint 名称（取倒数第二段，跳过 TLD）"""
     import re
     m = re.search(r'//([^/:]+)', url)
     if m:
         host = m.group(1)
         parts = host.split('.')
-        skip = {'com', 'org', 'net', 'io', 'v1', 'api', 'www'}
-        for candidate in reversed(parts):
-            if candidate not in skip and not candidate.isdigit():
-                return candidate
-        # 全是 skip 或数字 → 返回完整 host
+        # IP 地址 → 返回完整 host
+        if all(p.isdigit() for p in parts):
+            return host
+        if len(parts) >= 2:
+            return parts[-2]   # e.g. deepseek / kimi / siliconflow
         return host
     return "default"
 
@@ -1022,9 +1022,11 @@ def _model_flat_config(v2_data: dict, alias: str) -> dict:
 
 
 def _upsert_model(v2_data: dict, alias: str, url: str,
-                     model_name: str, credential: dict) -> str:
+                     model_name: str, credential: dict,
+                     ep_name: str = "") -> str:
     """在 endpoint 下新增/更新模型。返回 endpoint 名称"""
-    ep_name = _infer_endpoint_name(url)
+    if not ep_name:
+        ep_name = _infer_endpoint_name(url)
     endpoints = v2_data.setdefault("endpoints", {})
     if ep_name in endpoints and endpoints[ep_name].get("url") != url:
         i = 2
@@ -2141,7 +2143,7 @@ def main():
             mn = input_with_prompt("模型名 (modelName): ")
             if not mn: continue
             ep = endpoints[active_ep]
-            _upsert_model(models, alias, ep["url"], mn, ep.get("credential", {}))
+            _upsert_model(models, alias, ep["url"], mn, ep.get("credential", {}), ep_name=active_ep)
             save_custom_models(models)
             _status_msg = f"✔ 已添加: {alias} → {mn}\n"
 
