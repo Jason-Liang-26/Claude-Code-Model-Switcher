@@ -983,11 +983,17 @@ def _iter_models(v2_data: dict):
     """遍历 (alias, flat_config)"""
     for ep_name, ep in v2_data.get("endpoints", {}).items():
         for alias, m in ep.get("models", {}).items():
-            yield alias, _model_flat_config(v2_data, alias)
+            yield alias, _model_flat_config(v2_data, alias, ep_name)
 
 
-def _find_model(v2_data: dict, alias: str):
-    """返回 (ep_name, model_dict) 或 (None, None)"""
+def _find_model(v2_data: dict, alias: str, ep_name: str = ""):
+    """返回 (ep_name, model_dict) 或 (None, None)。
+    若指定 ep_name，仅在该 endpoint 内查找。"""
+    if ep_name:
+        ep = v2_data.get("endpoints", {}).get(ep_name, {})
+        if alias in ep.get("models", {}):
+            return ep_name, ep["models"][alias]
+        return None, None
     for ep_name, ep in v2_data.get("endpoints", {}).items():
         if alias in ep.get("models", {}):
             return ep_name, ep["models"][alias]
@@ -1018,9 +1024,9 @@ def _infer_endpoint_name(url: str) -> str:
     return "default"
 
 
-def _model_flat_config(v2_data: dict, alias: str) -> dict:
+def _model_flat_config(v2_data: dict, alias: str, ep_name: str = "") -> dict:
     """合成扁平配置 {url, modelName, credential, endpoint}"""
-    ep_name, m = _find_model(v2_data, alias)
+    ep_name, m = _find_model(v2_data, alias, ep_name)
     ep = v2_data.get("endpoints", {}).get(ep_name, {}) if ep_name else {}
     return {
         "url": ep.get("url", ""),
@@ -1100,11 +1106,12 @@ _ROLE_ENV_MAP = [
 
 
 def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None,
-                           project_routing: dict = None):
+                           project_routing: dict = None, ep_name: str = ""):
     """写入项目 .claude/settings.local.json (env 不含 sk) 并生成 helper 脚本。
 
     路由来源: project_routing（项目级编辑）> endpoint defaultRouting > 当前模型。
-    同时写入 ccms_settings.local.json 快照。"""
+    同时写入 ccms_settings.local.json 快照。
+    ep_name: 若指定，限定在该 endpoint 内查找路由和模型。"""
     settings = load_local_settings()
     if "env" not in settings:
         settings["env"] = {}
@@ -1115,15 +1122,15 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None,
     if project_routing is not None:
         routing = project_routing
     elif v2_data:
-        ep_name = _find_model(v2_data, alias)[0]
-        ep = v2_data.get("endpoints", {}).get(ep_name, {}) if ep_name else {}
+        found_ep = ep_name or _find_model(v2_data, alias)[0]
+        ep = v2_data.get("endpoints", {}).get(found_ep, {}) if found_ep else {}
         routing = ep.get("defaultRouting")
 
     if routing:
         for role, env_key in _ROLE_ENV_MAP:
             target_alias = routing.get(role)
-            if target_alias and _find_model(v2_data, target_alias)[0]:
-                target_cfg = _model_flat_config(v2_data, target_alias)
+            if target_alias and _find_model(v2_data, target_alias, ep_name)[0]:
+                target_cfg = _model_flat_config(v2_data, target_alias, ep_name)
                 env[env_key] = target_cfg.get("modelName", target_alias)
     else:
         # 无路由表时 4 路全部指向当前模型
@@ -1151,12 +1158,12 @@ def write_model_to_project(alias: str, model_config: dict, v2_data: dict = None,
 
     # 写入 ccms_settings.local.json 快照
     if v2_data and (routing or project_routing is not None):
-        ep_name = _find_model(v2_data, alias)[0]
-        snapshot = {"endpoint": ep_name or "", "routing": {}}
+        snap_ep = ep_name or _find_model(v2_data, alias)[0]
+        snapshot = {"endpoint": snap_ep or "", "routing": {}}
         for role, _ in _ROLE_ENV_MAP:
             target_alias = routing.get(role)
             if target_alias:
-                target_cfg = _model_flat_config(v2_data, target_alias)
+                target_cfg = _model_flat_config(v2_data, target_alias, ep_name)
                 snapshot["routing"][role] = {
                     "alias": target_alias,
                     "modelName": target_cfg.get("modelName", target_alias)
@@ -1308,7 +1315,7 @@ def cmd_reveal():
             print(f"  [{ep_name}]")
             for role in ("opus", "sonnet", "haiku", "subagent"):
                 alias = dr.get(role, "—")
-                cfg = _model_flat_config(models, alias) if alias != "—" else {}
+                cfg = _model_flat_config(models, alias, ep_name) if alias != "—" else {}
                 mn = cfg.get("modelName", alias)
                 print(f"    {role:<10} → {alias:<20} ({mn})")
         else:
@@ -2046,8 +2053,8 @@ def _routing_picker(v2_data: dict, active_ep: str, model_aliases: list[str],
         rep = new_routing.get("sonnet") or list(new_routing.values())[0] if new_routing else (
             model_aliases[0] if model_aliases else "")
         if rep:
-            write_model_to_project(rep, _model_flat_config(v2_data, rep), v2_data,
-                                   project_routing=new_routing)
+            write_model_to_project(rep, _model_flat_config(v2_data, rep, active_ep), v2_data,
+                                   project_routing=new_routing, ep_name=active_ep)
         return "✔ 当前项目路由已更新\n"
 
 
@@ -2184,8 +2191,8 @@ def main():
                 settings.setdefault("env", {})["CCMS_ENDPOINT"] = ep_name
                 save_local_settings(settings)
                 rep = routing_to_apply.get("sonnet") or (aliases_sel[0] if aliases_sel else "none")
-                cfg = _model_flat_config(models, rep) if aliases_sel else {"url": ep_cfg.get("url", ""), "modelName": "", "credential": {}}
-                write_model_to_project(rep, cfg, models)
+                cfg = _model_flat_config(models, rep, ep_name) if aliases_sel else {"url": ep_cfg.get("url", ""), "modelName": "", "credential": {}}
+                write_model_to_project(rep, cfg, models, ep_name=ep_name)
                 _status_msg = f"✔ 已切换至 {ep_name}，路由已应用\n"
                 # 检查全局 gitignore 是否配置
                 _, missing = _check_global_gitignore_rules()
@@ -2239,7 +2246,8 @@ def main():
                 save_custom_models(models)
                 if model_aliases:
                     write_model_to_project(model_aliases[0],
-                                           _model_flat_config(models, model_aliases[0]), models)
+                                           _model_flat_config(models, model_aliases[0], active_ep), models,
+                                           ep_name=active_ep)
                 _status_msg = "✔ 凭据已更新\n"
 
         # ---- 管理 Endpoints ----
